@@ -14,6 +14,25 @@ func NewNodeWithOptions(opts ...NodeOption) *Node {
 	return n
 }
 
+// ToOption returns a new NodeOption that sets the values from the passed in Node
+func (n *Node) ToOption() NodeOption {
+	return func(to *Node) {
+		to.ID = n.ID
+		to.PresharedKey = n.PresharedKey
+		to.Datastore = n.Datastore
+		to.DBName = n.DBName
+		to.URI = n.URI
+		to.GrpcPort = n.GrpcPort
+		to.HTTPPort = n.HTTPPort
+		to.DispatchPort = n.DispatchPort
+		to.MetricsPort = n.MetricsPort
+		to.HedgingEnabled = n.HedgingEnabled
+		to.Pid = n.Pid
+		to.Cancel = n.Cancel
+		to.client = n.client
+	}
+}
+
 // NodeWithOptions configures an existing Node with the passed in options set
 func NodeWithOptions(n *Node, opts ...NodeOption) *Node {
 	for _, o := range opts {
@@ -43,10 +62,10 @@ func WithDatastore(datastore string) NodeOption {
 	}
 }
 
-// WithDbName returns an option that can set DbName on a Node
-func WithDbName(dbName string) NodeOption {
+// WithDBName returns an option that can set DBName on a Node
+func WithDBName(dBName string) NodeOption {
 	return func(n *Node) {
-		n.DbName = dbName
+		n.DBName = dBName
 	}
 }
 
@@ -64,10 +83,10 @@ func WithGrpcPort(grpcPort int) NodeOption {
 	}
 }
 
-// WithHttpPort returns an option that can set HttpPort on a Node
-func WithHttpPort(httpPort int) NodeOption {
+// WithHTTPPort returns an option that can set HTTPPort on a Node
+func WithHTTPPort(hTTPPort int) NodeOption {
 	return func(n *Node) {
-		n.HttpPort = httpPort
+		n.HTTPPort = hTTPPort
 	}
 }
 
@@ -82,13 +101,6 @@ func WithDispatchPort(dispatchPort int) NodeOption {
 func WithMetricsPort(metricsPort int) NodeOption {
 	return func(n *Node) {
 		n.MetricsPort = metricsPort
-	}
-}
-
-// WithDashboardPort returns an option that can set DashboardPort on a Node
-func WithDashboardPort(dashboardPort int) NodeOption {
-	return func(n *Node) {
-		n.DashboardPort = dashboardPort
 	}
 }
 

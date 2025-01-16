@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/log/zerologadapter"
-	"github.com/rs/zerolog/log"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	pgxcommon "github.com/authzed/spicedb/internal/datastore/postgres/common"
+	"github.com/authzed/spicedb/pkg/migrate"
 )
 
 const (
@@ -33,8 +34,8 @@ func NewCRDBDriver(url string) (*CRDBDriver, error) {
 	if err != nil {
 		return nil, fmt.Errorf(errUnableToInstantiate, err)
 	}
-
-	connConfig.Logger = zerologadapter.NewLogger(log.Logger)
+	pgxcommon.ConfigurePGXLogger(connConfig)
+	pgxcommon.ConfigureOTELTracer(connConfig, false)
 
 	db, err := pgx.ConnectConfig(context.Background(), connConfig)
 	if err != nil {
@@ -46,10 +47,10 @@ func NewCRDBDriver(url string) (*CRDBDriver, error) {
 
 // Version returns the version of the schema to which the connected database
 // has been migrated.
-func (apd *CRDBDriver) Version() (string, error) {
+func (apd *CRDBDriver) Version(ctx context.Context) (string, error) {
 	var loaded string
 
-	if err := apd.db.QueryRow(context.Background(), queryLoadVersion).Scan(&loaded); err != nil {
+	if err := apd.db.QueryRow(ctx, queryLoadVersion).Scan(&loaded); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == postgresMissingTableErrorCode {
 			return "", nil
@@ -60,19 +61,29 @@ func (apd *CRDBDriver) Version() (string, error) {
 	return loaded, nil
 }
 
-// WriteVersion overwrites the value stored to track the version of the
-// database schema.
-func (apd *CRDBDriver) WriteVersion(version, replaced string) error {
-	result, err := apd.db.Exec(context.Background(), queryWriteVersion, version, replaced)
+// Conn returns the underlying pgx.Conn instance for this driver
+func (apd *CRDBDriver) Conn() *pgx.Conn {
+	return apd.db
+}
+
+func (apd *CRDBDriver) RunTx(ctx context.Context, f migrate.TxMigrationFunc[pgx.Tx]) error {
+	return pgx.BeginFunc(ctx, apd.db, func(tx pgx.Tx) error {
+		return f(ctx, tx)
+	})
+}
+
+// Close disposes the driver.
+func (apd *CRDBDriver) Close(ctx context.Context) error {
+	return apd.db.Close(ctx)
+}
+
+func (apd *CRDBDriver) WriteVersion(ctx context.Context, tx pgx.Tx, version, replaced string) error {
+	result, err := tx.Exec(ctx, queryWriteVersion, version, replaced)
 	if err != nil {
 		return fmt.Errorf("unable to update version row: %w", err)
 	}
 
 	updatedCount := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("unable to compute number of rows affected: %w", err)
-	}
-
 	if updatedCount != 1 {
 		return fmt.Errorf("writing version update affected %d rows, should be 1", updatedCount)
 	}
@@ -80,7 +91,4 @@ func (apd *CRDBDriver) WriteVersion(version, replaced string) error {
 	return nil
 }
 
-// Dispose disposes the driver.
-func (apd *CRDBDriver) Close() error {
-	return apd.db.Close(context.Background())
-}
+var _ migrate.Driver[*pgx.Conn, pgx.Tx] = &CRDBDriver{}

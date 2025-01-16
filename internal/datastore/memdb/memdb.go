@@ -5,436 +5,363 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
-	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
+	"github.com/authzed/spicedb/internal/datastore/common"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
+	"github.com/authzed/spicedb/pkg/tuple"
+
+	"github.com/google/uuid"
 	"github.com/hashicorp/go-memdb"
-	"github.com/jzelinskie/stringz"
-	"github.com/shopspring/decimal"
 
-	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-
-	"github.com/authzed/spicedb/internal/datastore"
+	"github.com/authzed/spicedb/internal/datastore/revisions"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	corev1 "github.com/authzed/spicedb/pkg/proto/core/v1"
 )
 
-func init() {
-	datastore.Engines = append(datastore.Engines, Engine)
-}
+const (
+	Engine                   = "memory"
+	defaultWatchBufferLength = 128
+	numAttempts              = 10
+)
+
+var ErrSerialization = errors.New("serialization error")
 
 // DisableGC is a convenient constant for setting the garbage collection
 // interval high enough that it will never run.
 const DisableGC = time.Duration(math.MaxInt64)
-
-const (
-	Engine            = "memory"
-	tableRelationship = "relationship"
-	tableTransaction  = "transaction"
-	tableNamespace    = "namespaceConfig"
-
-	indexID                         = "id"
-	indexUnique                     = "unique"
-	indexTimestamp                  = "timestamp"
-	indexLive                       = "live"
-	indexNamespace                  = "namespace"
-	indexNamespaceAndResourceID     = "namespaceAndResourceID"
-	indexNamespaceAndRelation       = "namespaceAndRelation"
-	indexNamespaceAndSubjectID      = "namespaceAndSubjectID"
-	indexSubjectNamespace           = "subjectNamespace"
-	indexFullSubject                = "subject"
-	indexSubjectAndResourceRelation = "subjectAndResourceRelation"
-	indexCreatedTxn                 = "createdTxn"
-	indexDeletedTxn                 = "deletedTxn"
-
-	defaultWatchBufferLength = 128
-
-	deletedTransactionID = ^uint64(0)
-
-	errUnableToInstantiateTuplestore = "unable to instantiate datastore: %w"
-)
-
-type hasLifetime interface {
-	getCreatedTxn() uint64
-	getDeletedTxn() uint64
-}
-
-type namespace struct {
-	name        string
-	configBytes []byte
-	createdTxn  uint64
-	deletedTxn  uint64
-}
-
-func (ns namespace) getCreatedTxn() uint64 {
-	return ns.createdTxn
-}
-
-func (ns namespace) getDeletedTxn() uint64 {
-	return ns.deletedTxn
-}
-
-var _ hasLifetime = &namespace{}
-
-type transaction struct {
-	id        uint64
-	timestamp uint64
-}
-
-type relationship struct {
-	namespace        string
-	resourceID       string
-	relation         string
-	subjectNamespace string
-	subjectObjectID  string
-	subjectRelation  string
-	createdTxn       uint64
-	deletedTxn       uint64
-}
-
-func (r relationship) getCreatedTxn() uint64 {
-	return r.createdTxn
-}
-
-func (r relationship) getDeletedTxn() uint64 {
-	return r.deletedTxn
-}
-
-var _ hasLifetime = &relationship{}
-
-func tupleEntryFromRelationship(r *v1.Relationship, created, deleted uint64) *relationship {
-	return &relationship{
-		namespace:        r.Resource.ObjectType,
-		resourceID:       r.Resource.ObjectId,
-		relation:         r.Relation,
-		subjectNamespace: r.Subject.Object.ObjectType,
-		subjectObjectID:  r.Subject.Object.ObjectId,
-		subjectRelation:  stringz.DefaultEmpty(r.Subject.OptionalRelation, datastore.Ellipsis),
-		createdTxn:       created,
-		deletedTxn:       deleted,
-	}
-}
-
-func (r relationship) Relationship() *v1.Relationship {
-	return &v1.Relationship{
-		Resource: &v1.ObjectReference{
-			ObjectType: r.namespace,
-			ObjectId:   r.resourceID,
-		},
-		Relation: r.relation,
-		Subject: &v1.SubjectReference{
-			Object: &v1.ObjectReference{
-				ObjectType: r.subjectNamespace,
-				ObjectId:   r.subjectObjectID,
-			},
-			OptionalRelation: stringz.Default(r.subjectRelation, "", datastore.Ellipsis),
-		},
-	}
-}
-
-func (r relationship) RelationTuple() *core.RelationTuple {
-	return &core.RelationTuple{
-		ObjectAndRelation: &core.ObjectAndRelation{
-			Namespace: r.namespace,
-			ObjectId:  r.resourceID,
-			Relation:  r.relation,
-		},
-		User: &core.User{UserOneof: &core.User_Userset{Userset: &core.ObjectAndRelation{
-			Namespace: r.subjectNamespace,
-			ObjectId:  r.subjectObjectID,
-			Relation:  r.subjectRelation,
-		}}},
-	}
-}
-
-func (r relationship) String() string {
-	return fmt.Sprintf(
-		"%s:%s#%s@%s:%s#%s[%d-%d)",
-		r.namespace,
-		r.resourceID,
-		r.relation,
-		r.subjectNamespace,
-		r.subjectObjectID,
-		r.subjectRelation,
-		r.createdTxn,
-		r.deletedTxn,
-	)
-}
-
-var schema = &memdb.DBSchema{
-	Tables: map[string]*memdb.TableSchema{
-		tableNamespace: {
-			Name: tableNamespace,
-			Indexes: map[string]*memdb.IndexSchema{
-				indexID: {
-					Name:   indexID,
-					Unique: true,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "name"},
-						},
-					},
-				},
-				indexUnique: {
-					Name:   indexUnique,
-					Unique: true,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "name"},
-							&memdb.UintFieldIndex{Field: "createdTxn"},
-						},
-					},
-				},
-				indexLive: {
-					Name:   indexLive,
-					Unique: true,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "name"},
-							&memdb.UintFieldIndex{Field: "deletedTxn"},
-						},
-					},
-				},
-				indexDeletedTxn: {
-					Name:    indexDeletedTxn,
-					Unique:  false,
-					Indexer: &memdb.UintFieldIndex{Field: "deletedTxn"},
-				},
-			},
-		},
-		tableTransaction: {
-			Name: tableTransaction,
-			Indexes: map[string]*memdb.IndexSchema{
-				indexID: {
-					Name:    indexID,
-					Unique:  true,
-					Indexer: &memdb.UintFieldIndex{Field: "id"},
-				},
-				indexTimestamp: {
-					Name:    indexTimestamp,
-					Unique:  false,
-					Indexer: &memdb.UintFieldIndex{Field: "timestamp"},
-				},
-			},
-		},
-		tableRelationship: {
-			Name: tableRelationship,
-			Indexes: map[string]*memdb.IndexSchema{
-				indexID: {
-					Name:   indexID,
-					Unique: true,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "namespace"},
-							&memdb.StringFieldIndex{Field: "resourceID"},
-							&memdb.StringFieldIndex{Field: "relation"},
-							&memdb.StringFieldIndex{Field: "subjectNamespace"},
-							&memdb.StringFieldIndex{Field: "subjectObjectID"},
-							&memdb.StringFieldIndex{Field: "subjectRelation"},
-							&memdb.UintFieldIndex{Field: "createdTxn"},
-						},
-					},
-				},
-				indexLive: {
-					Name:   indexLive,
-					Unique: true,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "namespace"},
-							&memdb.StringFieldIndex{Field: "resourceID"},
-							&memdb.StringFieldIndex{Field: "relation"},
-							&memdb.StringFieldIndex{Field: "subjectNamespace"},
-							&memdb.StringFieldIndex{Field: "subjectObjectID"},
-							&memdb.StringFieldIndex{Field: "subjectRelation"},
-							&memdb.UintFieldIndex{Field: "deletedTxn"},
-						},
-					},
-				},
-				indexNamespace: {
-					Name:    indexNamespace,
-					Unique:  false,
-					Indexer: &memdb.StringFieldIndex{Field: "namespace"},
-				},
-				indexNamespaceAndResourceID: {
-					Name:   indexNamespaceAndResourceID,
-					Unique: false,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "namespace"},
-							&memdb.StringFieldIndex{Field: "resourceID"},
-						},
-					},
-				},
-				indexNamespaceAndRelation: {
-					Name:   indexNamespaceAndRelation,
-					Unique: false,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "namespace"},
-							&memdb.StringFieldIndex{Field: "relation"},
-						},
-					},
-				},
-				indexNamespaceAndSubjectID: {
-					Name:   indexNamespaceAndSubjectID,
-					Unique: false,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "namespace"},
-							&memdb.StringFieldIndex{Field: "subjectNamespace"},
-							&memdb.StringFieldIndex{Field: "subjectObjectID"},
-						},
-					},
-				},
-				indexSubjectNamespace: {
-					Name:   indexSubjectNamespace,
-					Unique: false,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "subjectNamespace"},
-						},
-					},
-				},
-				indexFullSubject: {
-					Name:   indexFullSubject,
-					Unique: false,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "subjectNamespace"},
-							&memdb.StringFieldIndex{Field: "subjectObjectID"},
-							&memdb.StringFieldIndex{Field: "subjectRelation"},
-						},
-					},
-				},
-				indexSubjectAndResourceRelation: {
-					Name:   indexSubjectAndResourceRelation,
-					Unique: false,
-					Indexer: &memdb.CompoundIndex{
-						Indexes: []memdb.Indexer{
-							&memdb.StringFieldIndex{Field: "subjectNamespace"},
-							&memdb.StringFieldIndex{Field: "namespace"},
-							&memdb.StringFieldIndex{Field: "relation"},
-						},
-					},
-				},
-				indexCreatedTxn: {
-					Name:    indexCreatedTxn,
-					Unique:  false,
-					Indexer: &memdb.UintFieldIndex{Field: "createdTxn"},
-				},
-				indexDeletedTxn: {
-					Name:    indexDeletedTxn,
-					Unique:  false,
-					Indexer: &memdb.UintFieldIndex{Field: "deletedTxn"},
-				},
-			},
-		},
-	},
-}
-
-type memdbDatastore struct {
-	sync.RWMutex
-	db                       *memdb.MemDB
-	watchBufferLength        uint16
-	revisionFuzzingTimedelta time.Duration
-	gcWindowInverted         time.Duration
-	simulatedLatency         time.Duration
-}
 
 // NewMemdbDatastore creates a new Datastore compliant datastore backed by memdb.
 //
 // If the watchBufferLength value of 0 is set then a default value of 128 will be used.
 func NewMemdbDatastore(
 	watchBufferLength uint16,
-	revisionFuzzingTimedelta,
+	revisionQuantization,
 	gcWindow time.Duration,
-	simulatedLatency time.Duration,
 ) (datastore.Datastore, error) {
-	if revisionFuzzingTimedelta > gcWindow {
-		return nil, fmt.Errorf(
-			errUnableToInstantiateTuplestore,
-			errors.New("gc window must be larger than fuzzing window"),
-		)
+	if revisionQuantization > gcWindow {
+		return nil, errors.New("gc window must be larger than quantization interval")
+	}
+
+	if revisionQuantization <= 1 {
+		revisionQuantization = 1
 	}
 
 	db, err := memdb.NewMemDB(schema)
 	if err != nil {
-		return nil, fmt.Errorf(errUnableToInstantiateTuplestore, err)
+		return nil, err
 	}
-
-	txn := db.Txn(true)
-	defer txn.Abort()
-
-	// Add a changelog entry to make the first revision non-zero, matching the other datastore
-	// implementations.
-	_, err = createNewTransaction(txn)
-	if err != nil {
-		return nil, fmt.Errorf(errUnableToInstantiateTuplestore, err)
-	}
-
-	txn.Commit()
 
 	if watchBufferLength == 0 {
 		watchBufferLength = defaultWatchBufferLength
 	}
 
+	uniqueID := uuid.NewString()
 	return &memdbDatastore{
-		db:                       db,
-		watchBufferLength:        watchBufferLength,
-		revisionFuzzingTimedelta: revisionFuzzingTimedelta,
+		CommonDecoder: revisions.CommonDecoder{
+			Kind: revisions.Timestamp,
+		},
+		db: db,
+		revisions: []snapshot{
+			{
+				revision: nowRevision(),
+				db:       db,
+			},
+		},
 
-		gcWindowInverted: -1 * gcWindow,
-		simulatedLatency: simulatedLatency,
+		negativeGCWindow:        gcWindow.Nanoseconds() * -1,
+		quantizationPeriod:      revisionQuantization.Nanoseconds(),
+		watchBufferLength:       watchBufferLength,
+		watchBufferWriteTimeout: 100 * time.Millisecond,
+		uniqueID:                uniqueID,
 	}, nil
 }
 
-func (mds *memdbDatastore) IsReady(ctx context.Context) (bool, error) {
-	return true, nil
+type memdbDatastore struct {
+	sync.RWMutex
+	revisions.CommonDecoder
+
+	db             *memdb.MemDB
+	revisions      []snapshot
+	activeWriteTxn *memdb.Txn
+
+	negativeGCWindow        int64
+	quantizationPeriod      int64
+	watchBufferLength       uint16
+	watchBufferWriteTimeout time.Duration
+	uniqueID                string
 }
 
-func (mds *memdbDatastore) NamespaceCacheKey(namespaceName string, revision datastore.Revision) (string, error) {
-	return fmt.Sprintf("%s@%s", namespaceName, revision), nil
+type snapshot struct {
+	revision revisions.TimestampRevision
+	db       *memdb.MemDB
 }
 
-func revisionFromVersion(version uint64) datastore.Revision {
-	return decimal.NewFromInt(int64(version))
+func (mdb *memdbDatastore) SnapshotReader(dr datastore.Revision) datastore.Reader {
+	mdb.RLock()
+	defer mdb.RUnlock()
+
+	if len(mdb.revisions) == 0 {
+		return &memdbReader{nil, nil, fmt.Errorf("memdb datastore is not ready"), time.Now()}
+	}
+
+	if err := mdb.checkRevisionLocalCallerMustLock(dr); err != nil {
+		return &memdbReader{nil, nil, err, time.Now()}
+	}
+
+	revIndex := sort.Search(len(mdb.revisions), func(i int) bool {
+		return mdb.revisions[i].revision.GreaterThan(dr) || mdb.revisions[i].revision.Equal(dr)
+	})
+
+	// handle the case when there is no revision snapshot newer than the requested revision
+	if revIndex == len(mdb.revisions) {
+		revIndex = len(mdb.revisions) - 1
+	}
+
+	rev := mdb.revisions[revIndex]
+	if rev.db == nil {
+		return &memdbReader{nil, nil, fmt.Errorf("memdb datastore is already closed"), time.Now()}
+	}
+
+	roTxn := rev.db.Txn(false)
+	txSrc := func() (*memdb.Txn, error) {
+		return roTxn, nil
+	}
+
+	return &memdbReader{noopTryLocker{}, txSrc, nil, time.Now()}
 }
 
-func (mds *memdbDatastore) Close() error {
-	mds.Lock()
-	mds.db = nil
-	mds.Unlock()
+func (mdb *memdbDatastore) SupportsIntegrity() bool {
+	return true
+}
+
+func (mdb *memdbDatastore) ReadWriteTx(
+	ctx context.Context,
+	f datastore.TxUserFunc,
+	opts ...options.RWTOptionsOption,
+) (datastore.Revision, error) {
+	config := options.NewRWTOptionsWithOptions(opts...)
+	txNumAttempts := numAttempts
+	if config.DisableRetries {
+		txNumAttempts = 1
+	}
+
+	for i := 0; i < txNumAttempts; i++ {
+		var tx *memdb.Txn
+		createTxOnce := sync.Once{}
+		txSrc := func() (*memdb.Txn, error) {
+			var err error
+			createTxOnce.Do(func() {
+				mdb.Lock()
+				defer mdb.Unlock()
+
+				if mdb.activeWriteTxn != nil {
+					err = ErrSerialization
+					return
+				}
+
+				if mdb.db == nil {
+					err = fmt.Errorf("datastore is closed")
+					return
+				}
+
+				tx = mdb.db.Txn(true)
+				tx.TrackChanges()
+				mdb.activeWriteTxn = tx
+			})
+
+			return tx, err
+		}
+
+		newRevision := mdb.newRevisionID()
+		rwt := &memdbReadWriteTx{memdbReader{&sync.Mutex{}, txSrc, nil, time.Now()}, newRevision}
+		if err := f(ctx, rwt); err != nil {
+			mdb.Lock()
+			if tx != nil {
+				tx.Abort()
+				mdb.activeWriteTxn = nil
+			}
+
+			// If the error was a serialization error, retry the transaction
+			if errors.Is(err, ErrSerialization) {
+				mdb.Unlock()
+
+				// If we don't sleep here, we run out of retries instantaneously
+				time.Sleep(1 * time.Millisecond)
+				continue
+			}
+			defer mdb.Unlock()
+
+			// We *must* return the inner error unmodified in case it's not an error type
+			// that supports unwrapping (e.g. gRPC errors)
+			return datastore.NoRevision, err
+		}
+
+		mdb.Lock()
+		defer mdb.Unlock()
+
+		tracked := common.NewChanges(revisions.TimestampIDKeyFunc, datastore.WatchRelationships|datastore.WatchSchema, 0)
+		if tx != nil {
+			if config.Metadata != nil && len(config.Metadata.GetFields()) > 0 {
+				if err := tracked.SetRevisionMetadata(ctx, newRevision, config.Metadata.AsMap()); err != nil {
+					return datastore.NoRevision, err
+				}
+			}
+
+			for _, change := range tx.Changes() {
+				switch change.Table {
+				case tableRelationship:
+					if change.After != nil {
+						rt, err := change.After.(*relationship).Relationship()
+						if err != nil {
+							return datastore.NoRevision, err
+						}
+
+						if err := tracked.AddRelationshipChange(ctx, newRevision, rt, tuple.UpdateOperationTouch); err != nil {
+							return datastore.NoRevision, err
+						}
+					} else if change.After == nil && change.Before != nil {
+						rt, err := change.Before.(*relationship).Relationship()
+						if err != nil {
+							return datastore.NoRevision, err
+						}
+
+						if err := tracked.AddRelationshipChange(ctx, newRevision, rt, tuple.UpdateOperationDelete); err != nil {
+							return datastore.NoRevision, err
+						}
+					} else {
+						return datastore.NoRevision, spiceerrors.MustBugf("unexpected relationship change")
+					}
+				case tableNamespace:
+					if change.After != nil {
+						loaded := &corev1.NamespaceDefinition{}
+						if err := loaded.UnmarshalVT(change.After.(*namespace).configBytes); err != nil {
+							return datastore.NoRevision, err
+						}
+
+						err := tracked.AddChangedDefinition(ctx, newRevision, loaded)
+						if err != nil {
+							return datastore.NoRevision, err
+						}
+					} else if change.After == nil && change.Before != nil {
+						err := tracked.AddDeletedNamespace(ctx, newRevision, change.Before.(*namespace).name)
+						if err != nil {
+							return datastore.NoRevision, err
+						}
+					} else {
+						return datastore.NoRevision, spiceerrors.MustBugf("unexpected namespace change")
+					}
+				case tableCaveats:
+					if change.After != nil {
+						loaded := &corev1.CaveatDefinition{}
+						if err := loaded.UnmarshalVT(change.After.(*caveat).definition); err != nil {
+							return datastore.NoRevision, err
+						}
+
+						err := tracked.AddChangedDefinition(ctx, newRevision, loaded)
+						if err != nil {
+							return datastore.NoRevision, err
+						}
+					} else if change.After == nil && change.Before != nil {
+						err := tracked.AddDeletedCaveat(ctx, newRevision, change.Before.(*caveat).name)
+						if err != nil {
+							return datastore.NoRevision, err
+						}
+					} else {
+						return datastore.NoRevision, spiceerrors.MustBugf("unexpected namespace change")
+					}
+				}
+			}
+
+			var rc datastore.RevisionChanges
+			changes, err := tracked.AsRevisionChanges(revisions.TimestampIDKeyLessThanFunc)
+			if err != nil {
+				return datastore.NoRevision, err
+			}
+
+			if len(changes) > 1 {
+				return datastore.NoRevision, spiceerrors.MustBugf("unexpected MemDB transaction with multiple revision changes")
+			} else if len(changes) == 1 {
+				rc = changes[0]
+			}
+
+			change := &changelog{
+				revisionNanos: newRevision.TimestampNanoSec(),
+				changes:       rc,
+			}
+			if err := tx.Insert(tableChangelog, change); err != nil {
+				return datastore.NoRevision, fmt.Errorf("error writing changelog: %w", err)
+			}
+
+			tx.Commit()
+		}
+		mdb.activeWriteTxn = nil
+
+		// Create a snapshot and add it to the revisions slice
+		if mdb.db == nil {
+			return datastore.NoRevision, fmt.Errorf("datastore has been closed")
+		}
+
+		snap := mdb.db.Snapshot()
+		mdb.revisions = append(mdb.revisions, snapshot{newRevision, snap})
+		return newRevision, nil
+	}
+
+	return datastore.NoRevision, NewSerializationMaxRetriesReachedErr(errors.New("serialization max retries exceeded; please reduce your parallel writes"))
+}
+
+func (mdb *memdbDatastore) ReadyState(_ context.Context) (datastore.ReadyState, error) {
+	mdb.RLock()
+	defer mdb.RUnlock()
+
+	return datastore.ReadyState{
+		Message: "missing expected initial revision",
+		IsReady: len(mdb.revisions) > 0,
+	}, nil
+}
+
+func (mdb *memdbDatastore) OfflineFeatures() (*datastore.Features, error) {
+	return &datastore.Features{
+		Watch: datastore.Feature{
+			Status: datastore.FeatureSupported,
+		},
+		IntegrityData: datastore.Feature{
+			Status: datastore.FeatureSupported,
+		},
+		ContinuousCheckpointing: datastore.Feature{
+			Status: datastore.FeatureUnsupported,
+		},
+		WatchEmitsImmediately: datastore.Feature{
+			Status: datastore.FeatureUnsupported,
+		},
+	}, nil
+}
+
+func (mdb *memdbDatastore) Features(_ context.Context) (*datastore.Features, error) {
+	return mdb.OfflineFeatures()
+}
+
+func (mdb *memdbDatastore) Close() error {
+	mdb.Lock()
+	defer mdb.Unlock()
+
+	if db := mdb.db; db != nil {
+		mdb.revisions = []snapshot{
+			{
+				revision: nowRevision(),
+				db:       db,
+			},
+		}
+	} else {
+		mdb.revisions = []snapshot{}
+	}
+
+	mdb.db = nil
+
 	return nil
 }
 
-func createNewTransaction(txn *memdb.Txn) (uint64, error) {
-	var newTransactionID uint64 = 1
-
-	lastChangeRaw, err := txn.Last(tableTransaction, indexID)
-	if err != nil {
-		return 0, err
-	}
-
-	if lastChangeRaw != nil {
-		newTransactionID = lastChangeRaw.(*transaction).id + 1
-	}
-
-	newChangelogEntry := &transaction{
-		id:        newTransactionID,
-		timestamp: uint64(time.Now().UnixNano()),
-	}
-
-	if err := txn.Insert(tableTransaction, newChangelogEntry); err != nil {
-		return 0, err
-	}
-
-	return newTransactionID, nil
-}
-
-// filterToLiveObjects creates a memdb.FilterFunc which returns true for the items to remove,
-// which is opposite of most filter implementations.
-func filterToLiveObjects(revision datastore.Revision) memdb.FilterFunc {
-	return func(hasLifetimeRaw interface{}) bool {
-		obj := hasLifetimeRaw.(hasLifetime)
-		return uint64(revision.IntPart()) < obj.getCreatedTxn() || uint64(revision.IntPart()) >= obj.getDeletedTxn()
-	}
-}
+var _ datastore.Datastore = &memdbDatastore{}

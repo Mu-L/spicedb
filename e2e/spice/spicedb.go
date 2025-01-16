@@ -10,9 +10,11 @@ import (
 
 	"github.com/authzed/grpcutil"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/authzed/spicedb/e2e"
 	"github.com/authzed/spicedb/e2e/cockroach"
+	"github.com/authzed/spicedb/internal/grpchelpers"
 )
 
 //go:generate go run github.com/ecordell/optgen -output spicedb_options.go . Node
@@ -22,13 +24,12 @@ type Node struct {
 	ID             string
 	PresharedKey   string
 	Datastore      string
-	DbName         string
+	DBName         string
 	URI            string
 	GrpcPort       int
-	HttpPort       int
+	HTTPPort       int
 	DispatchPort   int
 	MetricsPort    int
-	DashboardPort  int
 	HedgingEnabled bool
 	Pid            int
 	Cancel         context.CancelFunc
@@ -47,18 +48,14 @@ func WithTestDefaults(opts ...NodeOption) NodeOption {
 		if s.DispatchPort == 0 {
 			s.DispatchPort = 50052
 		}
-		if s.HttpPort == 0 {
-			s.HttpPort = 8443
+		if s.HTTPPort == 0 {
+			s.HTTPPort = 8443
 		}
 		if s.MetricsPort == 0 {
 			s.MetricsPort = 9090
 		}
-		if s.DashboardPort == 0 {
-			// this would typically be 8080, but conflicts with Node's dash
-			s.DashboardPort = 8090
-		}
-		if len(s.DbName) == 0 {
-			s.DbName = "spicedb"
+		if len(s.DBName) == 0 {
+			s.DBName = "spicedb"
 		}
 		if len(s.PresharedKey) == 0 {
 			s.PresharedKey = "testtesttesttest"
@@ -81,10 +78,15 @@ func (s *Node) Start(ctx context.Context, logprefix string, args ...string) erro
 		"--datastore-engine=" + s.Datastore,
 		"--datastore-conn-uri=" + s.URI,
 		fmt.Sprintf("--grpc-addr=:%d", s.GrpcPort),
-		fmt.Sprintf("--http-addr=:%d", s.HttpPort),
+		fmt.Sprintf("--http-addr=:%d", s.HTTPPort),
 		fmt.Sprintf("--dispatch-cluster-addr=:%d", s.DispatchPort),
 		fmt.Sprintf("--metrics-addr=:%d", s.MetricsPort),
-		fmt.Sprintf("--dashboard-addr=:%d", s.DashboardPort),
+		"--datastore-disable-stats=true",
+		"--datastore-max-tx-retries=100",
+
+		// This ensure that we can call WriteSchema multiple times to progressively build the
+		// overall set of namespaces.
+		"--testing-only-schema-additive-writes=true",
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -112,9 +114,12 @@ func (s *Node) Connect(ctx context.Context, out io.Writer) error {
 	addr := net.JoinHostPort("localhost", strconv.Itoa(s.GrpcPort))
 	e2e.WaitForServerReady(addr, out)
 
-	conn, err := grpc.DialContext(ctx, addr,
-		grpc.WithBlock(), grpc.WithInsecure(),
-		grpcutil.WithInsecureBearerToken(s.PresharedKey))
+	conn, err := grpchelpers.DialAndWait(
+		ctx,
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpcutil.WithInsecureBearerToken(s.PresharedKey),
+	)
 	if err != nil {
 		return err
 	}
@@ -141,15 +146,14 @@ func NewClusterFromCockroachCluster(c cockroach.Cluster, opts ...NodeOption) Clu
 
 	for i := 0; i < len(c); i++ {
 		ss = append(ss, &Node{
-			ID:            strconv.Itoa(i + 1),
-			PresharedKey:  proto.PresharedKey,
-			Datastore:     "cockroachdb",
-			URI:           c[i].ConnectionString(proto.DbName),
-			GrpcPort:      proto.GrpcPort + 2*i,
-			DispatchPort:  proto.DispatchPort + 2*i,
-			HttpPort:      proto.HttpPort + 2*i,
-			MetricsPort:   proto.MetricsPort + i,
-			DashboardPort: proto.DashboardPort + i,
+			ID:           strconv.Itoa(i + 1),
+			PresharedKey: proto.PresharedKey,
+			Datastore:    "cockroachdb",
+			URI:          c[i].ConnectionString(proto.DBName),
+			GrpcPort:     proto.GrpcPort + 2*i,
+			DispatchPort: proto.DispatchPort + 2*i,
+			HTTPPort:     proto.HTTPPort + 2*i,
+			MetricsPort:  proto.MetricsPort + i,
 		})
 	}
 	return ss

@@ -1,6 +1,10 @@
 package migrations
 
-import "context"
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+)
 
 const (
 	createTransactions = `CREATE TABLE transactions (
@@ -10,26 +14,9 @@ const (
 )
 
 func init() {
-	if err := CRDBMigrations.Register("add-transactions-table", "initial", func(apd *CRDBDriver) error {
-		ctx := context.Background()
-
-		tx, err := apd.db.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
-		statements := []string{
-			createTransactions,
-		}
-		for _, stmt := range statements {
-			_, err := tx.Exec(ctx, stmt)
-			if err != nil {
-				return err
-			}
-		}
-
-		return tx.Commit(ctx)
+	if err := CRDBMigrations.Register("add-transactions-table", "initial", noNonAtomicMigration, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, createTransactions)
+		return err
 	}); err != nil {
 		panic("failed to register migration: " + err.Error())
 	}

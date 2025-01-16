@@ -9,104 +9,129 @@ import (
 	"os"
 	"testing"
 
-	v1_api "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"github.com/google/go-cmp/cmp"
-	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/testing/protocmp"
 
-	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-
+	"github.com/authzed/spicedb/internal/datastore/common"
+	"github.com/authzed/spicedb/internal/datastore/dsfortesting"
 	"github.com/authzed/spicedb/internal/datastore/memdb"
 	expand "github.com/authzed/spicedb/internal/graph"
 	datastoremw "github.com/authzed/spicedb/internal/middleware/datastore"
-	"github.com/authzed/spicedb/internal/namespace"
 	"github.com/authzed/spicedb/internal/testfixtures"
 	"github.com/authzed/spicedb/pkg/graph"
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
+	"github.com/authzed/spicedb/pkg/testutil"
 	"github.com/authzed/spicedb/pkg/tuple"
 )
 
-var (
-	_this *core.ObjectAndRelation
+func DS(objectType string, objectID string, objectRelation string) *core.DirectSubject {
+	return &core.DirectSubject{
+		Subject: tuple.CoreONR(objectType, objectID, objectRelation),
+	}
+}
 
-	companyOwner = graph.Leaf(ONR("folder", "company", "owner"),
-		tuple.User(ONR("user", "owner", expand.Ellipsis)),
+var ONRRef = tuple.ONRRef
+
+var (
+	companyOwner = graph.Leaf(ONRRef("folder", "company", "owner"),
+		(DS("user", "owner", expand.Ellipsis)),
 	)
-	companyEditor = graph.Union(ONR("folder", "company", "editor"),
-		graph.Leaf(_this),
+	companyEditor = graph.Leaf(ONRRef("folder", "company", "editor"))
+
+	companyEdit = graph.Union(ONRRef("folder", "company", "edit"),
+		companyEditor,
 		companyOwner,
 	)
 
-	companyViewer = graph.Union(ONR("folder", "company", "viewer"),
-		graph.Leaf(_this,
-			tuple.User(ONR("user", "legal", "...")),
-			tuple.User(ONR("folder", "auditors", "viewer")),
-		),
-		companyEditor,
-		graph.Union(ONR("folder", "company", "viewer")),
+	companyViewer = graph.Leaf(ONRRef("folder", "company", "viewer"),
+		(DS("user", "legal", "...")),
+		(DS("folder", "auditors", "viewer")),
 	)
 
-	auditorsOwner = graph.Leaf(ONR("folder", "auditors", "owner"))
+	companyView = graph.Union(ONRRef("folder", "company", "view"),
+		companyViewer,
+		companyEdit,
+		graph.Union(ONRRef("folder", "company", "view")),
+	)
 
-	auditorsEditor = graph.Union(ONR("folder", "auditors", "editor"),
-		graph.Leaf(_this),
+	auditorsOwner = graph.Leaf(ONRRef("folder", "auditors", "owner"))
+
+	auditorsEditor = graph.Leaf(ONRRef("folder", "auditors", "editor"))
+
+	auditorsEdit = graph.Union(ONRRef("folder", "auditors", "edit"),
+		auditorsEditor,
 		auditorsOwner,
 	)
 
-	auditorsViewerRecursive = graph.Union(ONR("folder", "auditors", "viewer"),
-		graph.Leaf(_this,
-			tuple.User(ONR("user", "auditor", "...")),
-		),
-		auditorsEditor,
-		graph.Union(ONR("folder", "auditors", "viewer")),
+	auditorsViewer = graph.Leaf(ONRRef("folder", "auditors", "viewer"),
+		(DS("user", "auditor", "...")),
 	)
 
-	companyViewerRecursive = graph.Union(ONR("folder", "company", "viewer"),
-		graph.Union(ONR("folder", "company", "viewer"),
-			auditorsViewerRecursive,
-			graph.Leaf(_this,
-				tuple.User(ONR("user", "legal", "...")),
-				tuple.User(ONR("folder", "auditors", "viewer")),
-			),
-		),
-		companyEditor,
-		graph.Union(ONR("folder", "company", "viewer")),
+	auditorsViewRecursive = graph.Union(ONRRef("folder", "auditors", "view"),
+		auditorsViewer,
+		auditorsEdit,
+		graph.Union(ONRRef("folder", "auditors", "view")),
 	)
 
-	docOwner = graph.Leaf(ONR("document", "masterplan", "owner"),
-		tuple.User(ONR("user", "product_manager", "...")),
+	companyViewRecursive = graph.Union(ONRRef("folder", "company", "view"),
+		graph.Union(ONRRef("folder", "company", "viewer"),
+			graph.Leaf(ONRRef("folder", "auditors", "viewer"),
+				(DS("user", "auditor", "..."))),
+			graph.Leaf(ONRRef("folder", "company", "viewer"),
+				(DS("user", "legal", "...")),
+				(DS("folder", "auditors", "viewer")))),
+		graph.Union(ONRRef("folder", "company", "edit"),
+			graph.Leaf(ONRRef("folder", "company", "editor")),
+			graph.Leaf(ONRRef("folder", "company", "owner"),
+				(DS("user", "owner", "...")))),
+		graph.Union(ONRRef("folder", "company", "view")))
+
+	docOwner = graph.Leaf(ONRRef("document", "masterplan", "owner"),
+		(DS("user", "product_manager", "...")),
 	)
-	docEditor = graph.Union(ONR("document", "masterplan", "editor"),
-		graph.Leaf(_this),
+	docEditor = graph.Leaf(ONRRef("document", "masterplan", "editor"))
+
+	docEdit = graph.Union(ONRRef("document", "masterplan", "edit"),
 		docOwner,
-	)
-	docViewer = graph.Union(ONR("document", "masterplan", "viewer"),
-		graph.Leaf(_this,
-			tuple.User(ONR("user", "eng_lead", "...")),
-		),
 		docEditor,
-		graph.Union(ONR("document", "masterplan", "viewer"),
-			graph.Union(ONR("folder", "plans", "viewer"),
-				graph.Leaf(_this,
-					tuple.User(ONR("user", "chief_financial_officer", "...")),
+	)
+
+	docViewer = graph.Leaf(ONRRef("document", "masterplan", "viewer"),
+		(DS("user", "eng_lead", "...")),
+	)
+
+	docView = graph.Union(ONRRef("document", "masterplan", "view"),
+		docViewer,
+		docEdit,
+		graph.Union(ONRRef("document", "masterplan", "view"),
+			graph.Union(ONRRef("folder", "plans", "view"),
+				graph.Leaf(ONRRef("folder", "plans", "viewer"),
+					(DS("user", "chief_financial_officer", "...")),
 				),
-				graph.Union(ONR("folder", "plans", "editor"),
-					graph.Leaf(_this),
-					graph.Leaf(ONR("folder", "plans", "owner")),
-				),
-				graph.Union(ONR("folder", "plans", "viewer")),
-			),
-			graph.Union(ONR("folder", "strategy", "viewer"),
-				graph.Leaf(_this),
-				graph.Union(ONR("folder", "strategy", "editor"),
-					graph.Leaf(_this),
-					graph.Leaf(ONR("folder", "strategy", "owner"),
-						tuple.User(ONR("user", "vp_product", "...")),
+				graph.Union(ONRRef("folder", "plans", "edit"),
+					graph.Leaf(ONRRef("folder", "plans", "editor")),
+					graph.Leaf(ONRRef("folder", "plans", "owner"))),
+				graph.Union(ONRRef("folder", "plans", "view"))),
+			graph.Union(ONRRef("folder", "strategy", "view"),
+				graph.Leaf(ONRRef("folder", "strategy", "viewer")),
+				graph.Union(ONRRef("folder", "strategy", "edit"),
+					graph.Leaf(ONRRef("folder", "strategy", "editor")),
+					graph.Leaf(ONRRef("folder", "strategy", "owner"),
+						(DS("user", "vp_product", "...")))),
+				graph.Union(ONRRef("folder", "strategy", "view"),
+					graph.Union(ONRRef("folder", "company", "view"),
+						graph.Leaf(ONRRef("folder", "company", "viewer"),
+							(DS("user", "legal", "...")),
+							(DS("folder", "auditors", "viewer"))),
+						graph.Union(ONRRef("folder", "company", "edit"),
+							graph.Leaf(ONRRef("folder", "company", "editor")),
+							graph.Leaf(ONRRef("folder", "company", "owner"),
+								(DS("user", "owner", "...")))),
+						graph.Union(ONRRef("folder", "company", "view")),
 					),
-				),
-				graph.Union(ONR("folder", "strategy", "viewer"),
-					companyViewer,
 				),
 			),
 		),
@@ -114,37 +139,40 @@ var (
 )
 
 func TestExpand(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
-		start                 *core.ObjectAndRelation
+		start                 tuple.ObjectAndRelation
 		expansionMode         v1.DispatchExpandRequest_ExpansionMode
 		expected              *core.RelationTupleTreeNode
 		expectedDispatchCount int
 		expectedDepthRequired int
 	}{
 		{start: ONR("folder", "company", "owner"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: companyOwner, expectedDispatchCount: 1, expectedDepthRequired: 1},
-		{start: ONR("folder", "company", "editor"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: companyEditor, expectedDispatchCount: 2, expectedDepthRequired: 2},
-		{start: ONR("folder", "company", "viewer"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: companyViewer, expectedDispatchCount: 3, expectedDepthRequired: 3},
+		{start: ONR("folder", "company", "edit"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: companyEdit, expectedDispatchCount: 3, expectedDepthRequired: 2},
+		{start: ONR("folder", "company", "view"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: companyView, expectedDispatchCount: 5, expectedDepthRequired: 3},
 		{start: ONR("document", "masterplan", "owner"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: docOwner, expectedDispatchCount: 1, expectedDepthRequired: 1},
-		{start: ONR("document", "masterplan", "editor"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: docEditor, expectedDispatchCount: 2, expectedDepthRequired: 2},
-		{start: ONR("document", "masterplan", "viewer"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: docViewer, expectedDispatchCount: 12, expectedDepthRequired: 5},
+		{start: ONR("document", "masterplan", "edit"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: docEdit, expectedDispatchCount: 3, expectedDepthRequired: 2},
+		{start: ONR("document", "masterplan", "view"), expansionMode: v1.DispatchExpandRequest_SHALLOW, expected: docView, expectedDispatchCount: 20, expectedDepthRequired: 5},
 
 		{start: ONR("folder", "auditors", "owner"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: auditorsOwner, expectedDispatchCount: 1, expectedDepthRequired: 1},
-		{start: ONR("folder", "auditors", "editor"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: auditorsEditor, expectedDispatchCount: 2, expectedDepthRequired: 2},
-		{start: ONR("folder", "auditors", "viewer"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: auditorsViewerRecursive, expectedDispatchCount: 3, expectedDepthRequired: 3},
+		{start: ONR("folder", "auditors", "edit"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: auditorsEdit, expectedDispatchCount: 3, expectedDepthRequired: 2},
+		{start: ONR("folder", "auditors", "view"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: auditorsViewRecursive, expectedDispatchCount: 5, expectedDepthRequired: 3},
 
 		{start: ONR("folder", "company", "owner"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: companyOwner, expectedDispatchCount: 1, expectedDepthRequired: 1},
-		{start: ONR("folder", "company", "editor"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: companyEditor, expectedDispatchCount: 2, expectedDepthRequired: 2},
-		{start: ONR("folder", "company", "viewer"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: companyViewerRecursive, expectedDispatchCount: 6, expectedDepthRequired: 4},
+		{start: ONR("folder", "company", "edit"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: companyEdit, expectedDispatchCount: 3, expectedDepthRequired: 2},
+		{start: ONR("folder", "company", "view"), expansionMode: v1.DispatchExpandRequest_RECURSIVE, expected: companyViewRecursive, expectedDispatchCount: 6, expectedDepthRequired: 3},
 	}
 
 	for _, tc := range testCases {
+		tc := tc
 		t.Run(fmt.Sprintf("%s-%s", tuple.StringONR(tc.start), tc.expansionMode), func(t *testing.T) {
 			require := require.New(t)
 
-			ctx, dispatch, revision := newLocalDispatcher(require)
+			ctx, dispatch, revision := newLocalDispatcher(t)
 
 			expandResult, err := dispatch.DispatchExpand(ctx, &v1.DispatchExpandRequest{
-				ObjectAndRelation: tc.start,
+				ResourceAndRelation: tc.start.ToCoreONR(),
 				Metadata: &v1.ResolverMeta{
 					AtRevision:     revision.String(),
 					DepthRemaining: 50,
@@ -155,8 +183,8 @@ func TestExpand(t *testing.T) {
 			require.NoError(err)
 			require.NotNil(expandResult.TreeNode)
 			require.GreaterOrEqual(expandResult.Metadata.DepthRequired, uint32(1))
-			require.Equal(tc.expectedDispatchCount, int(expandResult.Metadata.DispatchCount))
-			require.Equal(tc.expectedDepthRequired, int(expandResult.Metadata.DepthRequired))
+			require.Equal(tc.expectedDispatchCount, int(expandResult.Metadata.DispatchCount), "mismatch in dispatch count")
+			require.Equal(tc.expectedDepthRequired, int(expandResult.Metadata.DepthRequired), "mismatch in depth required")
 
 			if diff := cmp.Diff(tc.expected, expandResult.TreeNode, protocmp.Transform()); diff != "" {
 				fset := token.NewFileSet()
@@ -207,11 +235,11 @@ func serialize(node *core.RelationTupleTreeNode) *ast.CallExpr {
 	case *core.RelationTupleTreeNode_IntermediateNode:
 		switch node.GetIntermediateNode().Operation {
 		case core.SetOperationUserset_EXCLUSION:
-			fName = "tf.E"
+			fName = "graph.Exclusion"
 		case core.SetOperationUserset_INTERSECTION:
-			fName = "tf.I"
+			fName = "graph.Intersection"
 		case core.SetOperationUserset_UNION:
-			fName = "tf.U"
+			fName = "graph.Union"
 		default:
 			panic("Unknown set operation")
 		}
@@ -221,11 +249,11 @@ func serialize(node *core.RelationTupleTreeNode) *ast.CallExpr {
 		}
 
 	case *core.RelationTupleTreeNode_LeafNode:
-		fName = "tf.Leaf"
-		for _, user := range node.GetLeafNode().Users {
-			onrExpr := onrExpr(user.GetUserset())
+		fName = "graph.Leaf"
+		for _, subject := range node.GetLeafNode().Subjects {
+			onrExpr := onrExpr(subject.Subject)
 			children = append(children, &ast.CallExpr{
-				Fun:  ast.NewIdent("User"),
+				Fun:  ast.NewIdent(""),
 				Args: []ast.Expr{onrExpr},
 			})
 		}
@@ -239,7 +267,7 @@ func serialize(node *core.RelationTupleTreeNode) *ast.CallExpr {
 
 func onrExpr(onr *core.ObjectAndRelation) ast.Expr {
 	return &ast.CallExpr{
-		Fun: ast.NewIdent("tf.ONR"),
+		Fun: ast.NewIdent("ONR"),
 		Args: []ast.Expr{
 			ast.NewIdent("\"" + onr.Namespace + "\""),
 			ast.NewIdent("\"" + onr.ObjectId + "\""),
@@ -249,44 +277,26 @@ func onrExpr(onr *core.ObjectAndRelation) ast.Expr {
 }
 
 func TestMaxDepthExpand(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 
-	rawDS, err := memdb.NewMemdbDatastore(0, 0, memdb.DisableGC, 0)
+	rawDS, err := dsfortesting.NewMemDBDatastoreForTesting(0, 0, memdb.DisableGC)
 	require.NoError(err)
 
 	ds, _ := testfixtures.StandardDatastoreWithSchema(rawDS, require)
 
-	mutations := []*v1_api.RelationshipUpdate{{
-		Operation: v1_api.RelationshipUpdate_OPERATION_CREATE,
-		Relationship: &v1_api.Relationship{
-			Resource: &v1_api.ObjectReference{
-				ObjectType: "folder",
-				ObjectId:   "oops",
-			},
-			Relation: "parent",
-			Subject: &v1_api.SubjectReference{
-				Object: &v1_api.ObjectReference{
-					ObjectType: "folder",
-					ObjectId:   "oops",
-				},
-			},
-		},
-	}}
-
+	tpl := tuple.MustParse("folder:oops#parent@folder:oops")
 	ctx := datastoremw.ContextWithHandle(context.Background())
 
-	revision, err := ds.WriteTuples(ctx, nil, mutations)
+	revision, err := common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tpl)
 	require.NoError(err)
-	require.True(revision.GreaterThan(decimal.Zero))
 	require.NoError(datastoremw.SetInContext(ctx, ds))
 
-	nsm, err := namespace.NewCachingNamespaceManager(testCacheConfig)
-	require.NoError(err)
-
-	dispatch := NewLocalOnlyDispatcher(nsm)
+	dispatch := NewLocalOnlyDispatcher(10, 100)
 
 	_, err = dispatch.DispatchExpand(ctx, &v1.DispatchExpandRequest{
-		ObjectAndRelation: ONR("folder", "oops", "viewer"),
+		ResourceAndRelation: tuple.CoreONR("folder", "oops", "view"),
 		Metadata: &v1.ResolverMeta{
 			AtRevision:     revision.String(),
 			DepthRemaining: 50,
@@ -295,4 +305,622 @@ func TestMaxDepthExpand(t *testing.T) {
 	})
 
 	require.Error(err)
+}
+
+func TestExpandOverSchema(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		schema        string
+		relationships []tuple.Relationship
+
+		start tuple.ObjectAndRelation
+
+		expansionMode    v1.DispatchExpandRequest_ExpansionMode
+		expectedTreeText string
+	}{
+		{
+			"basic any arrow",
+			`
+			definition user {}
+
+			definition folder {
+				relation viewer: user
+			}
+			
+			definition document {
+				relation folder: folder
+				permission view = folder->viewer
+			}`,
+			[]tuple.Relationship{
+				tuple.MustParse("document:testdoc#folder@folder:testfolder1"),
+				tuple.MustParse("document:testdoc#folder@folder:testfolder2"),
+				tuple.MustParse("folder:testfolder1#viewer@user:tom"),
+				tuple.MustParse("folder:testfolder1#viewer@user:fred"),
+				tuple.MustParse("folder:testfolder2#viewer@user:sarah"),
+			},
+
+			tuple.MustParseONR("document:testdoc#view"),
+
+			v1.DispatchExpandRequest_SHALLOW,
+			`intermediate_node:  {
+				operation:  UNION
+				child_nodes:  {
+				intermediate_node:  {
+					operation:  UNION
+					child_nodes:  {
+					leaf_node:  {
+						subjects:  {
+						subject:  {
+							namespace:  "user"
+							object_id:  "fred"
+							relation:  "..."
+						}
+						}
+						subjects:  {
+						subject:  {
+							namespace:  "user"
+							object_id:  "tom"
+							relation:  "..."
+						}
+						}
+					}
+					expanded:  {
+						namespace:  "folder"
+						object_id:  "testfolder1"
+						relation:  "viewer"
+					}
+					}
+					child_nodes:  {
+					leaf_node:  {
+						subjects:  {
+						subject:  {
+							namespace:  "user"
+							object_id:  "sarah"
+							relation:  "..."
+						}
+						}
+					}
+					expanded:  {
+						namespace:  "folder"
+						object_id:  "testfolder2"
+						relation:  "viewer"
+					}
+					}
+				}
+				expanded:  {
+					namespace:  "document"
+					object_id:  "testdoc"
+					relation:  "view"
+				}
+				}
+			}
+			expanded:  {
+				namespace:  "document"
+				object_id:  "testdoc"
+				relation:  "view"
+			}`,
+		},
+		{
+			"basic all arrow",
+			`
+			definition user {}
+
+			definition folder {
+				relation viewer: user
+			}
+			
+			definition document {
+				relation folder: folder
+				permission view = folder.all(viewer)
+			}`,
+			[]tuple.Relationship{
+				tuple.MustParse("document:testdoc#folder@folder:testfolder1"),
+				tuple.MustParse("document:testdoc#folder@folder:testfolder2"),
+				tuple.MustParse("folder:testfolder1#viewer@user:tom"),
+				tuple.MustParse("folder:testfolder1#viewer@user:fred"),
+				tuple.MustParse("folder:testfolder2#viewer@user:tom"),
+				tuple.MustParse("folder:testfolder2#viewer@user:sarah"),
+			},
+
+			tuple.MustParseONR("document:testdoc#view"),
+
+			v1.DispatchExpandRequest_SHALLOW,
+			`
+			intermediate_node: {
+				operation: UNION
+				child_nodes: {
+				intermediate_node: {
+					operation: INTERSECTION
+					child_nodes: {
+					leaf_node: {
+						subjects: {
+						subject: {
+							namespace: "user"
+							object_id: "fred"
+							relation: "..."
+						}
+						}
+						subjects: {
+						subject: {
+							namespace: "user"
+							object_id: "tom"
+							relation: "..."
+						}
+						}
+					}
+					expanded: {
+						namespace: "folder"
+						object_id: "testfolder1"
+						relation: "viewer"
+					}
+					}
+					child_nodes: {
+					leaf_node: {
+						subjects: {
+						subject: {
+							namespace: "user"
+							object_id: "sarah"
+							relation: "..."
+						}
+						}
+						subjects: {
+						subject: {
+							namespace: "user"
+							object_id: "tom"
+							relation: "..."
+						}
+						}
+					}
+					expanded: {
+						namespace: "folder"
+						object_id: "testfolder2"
+						relation: "viewer"
+					}
+					}
+				}
+				expanded: {
+					namespace: "document"
+					object_id: "testdoc"
+					relation: "view"
+				}
+				}
+			}
+			expanded: {
+				namespace: "document"
+				object_id: "testdoc"
+				relation: "view"
+			}
+			`,
+		},
+		{
+			"basic caveated subject",
+			`
+			definition user {}
+
+			caveat somecaveat(somecondition int) {
+				somecondition == 42
+			}
+
+			definition document {
+				relation viewer: user with somecaveat | user
+			}
+			`,
+			[]tuple.Relationship{
+				tuple.MustParse("document:testdoc#viewer@user:sarah[somecaveat]"),
+				tuple.MustParse("document:testdoc#viewer@user:mary"),
+			},
+			tuple.MustParseONR("document:testdoc#viewer"),
+			v1.DispatchExpandRequest_SHALLOW,
+			`
+			leaf_node: {
+				subjects: {
+					subject: {
+						namespace: "user"
+						object_id: "mary"
+						relation: "..."
+					}
+				}
+				subjects: {
+					subject: {
+						namespace: "user"
+						object_id: "sarah"
+						relation: "..."
+					}
+					caveat_expression: {
+						caveat: {
+							caveat_name: "somecaveat"
+							context: {}
+						}
+					}
+				}
+			}
+			expanded: {
+				namespace: "document"
+				object_id: "testdoc"
+				relation: "viewer"
+			}
+			`,
+		},
+		{
+			"caveated shallow indirect",
+			`
+			definition user {}
+
+			caveat somecaveat(somecondition int) {
+				somecondition == 42
+			}
+
+			definition group {
+				relation member: user
+			}
+
+			definition document {
+				relation viewer: group#member with somecaveat
+			}
+			`,
+			[]tuple.Relationship{
+				tuple.MustParse("document:testdoc#viewer@group:test#member[somecaveat]"),
+				tuple.MustParse("group:test#member@user:mary"),
+			},
+			tuple.MustParseONR("document:testdoc#viewer"),
+			v1.DispatchExpandRequest_SHALLOW,
+			`
+			leaf_node: {
+				subjects: {
+					subject: {
+						namespace: "group"
+						object_id: "test"
+						relation: "member"
+					}
+					caveat_expression: {
+						caveat: {
+							caveat_name: "somecaveat"
+							context: {}
+						}
+					}
+				}
+			}
+			expanded: {
+				namespace: "document"
+				object_id: "testdoc"
+				relation: "viewer"
+			}
+			`,
+		},
+		{
+			"caveated recursive indirect",
+			`
+			definition user {}
+
+			caveat somecaveat(somecondition int) {
+				somecondition == 42
+			}
+
+			caveat anothercaveat(somecondition int) {
+				somecondition != 42
+			}
+
+			definition group {
+				relation member: user
+			}
+
+			definition document {
+				relation viewer: group#member with somecaveat
+			}
+			`,
+			[]tuple.Relationship{
+				tuple.MustParse("document:testdoc#viewer@group:test#member[somecaveat]"),
+				tuple.MustParse("group:test#member@user:mary"),
+				tuple.MustParse("group:test#member@user:sarah[anothercaveat]"),
+			},
+			tuple.MustParseONR("document:testdoc#viewer"),
+			v1.DispatchExpandRequest_RECURSIVE,
+			`
+			intermediate_node: {
+				operation: UNION
+				child_nodes: {
+					leaf_node: {
+						subjects: {
+							subject: {
+								namespace: "user"
+								object_id: "mary"
+								relation: "..."
+							}
+						}
+						subjects: {
+							subject: {
+								namespace: "user"
+								object_id: "sarah"
+								relation: "..."
+							}
+							caveat_expression: {
+								caveat: {
+									caveat_name: "anothercaveat"
+									context: {}
+								}
+							}
+						}
+					}
+					expanded: {
+						namespace: "group"
+						object_id: "test"
+						relation: "member"
+					}
+					caveat_expression: {
+						caveat: {
+							caveat_name: "somecaveat"
+							context: {}
+						}
+					}
+				}
+				child_nodes: {
+					leaf_node: {
+						subjects: {
+							subject: {
+								namespace: "group"
+								object_id: "test"
+								relation: "member"
+							}
+							caveat_expression: {
+								caveat: {
+									caveat_name: "somecaveat"
+									context: {}
+								}
+							}
+						}
+					}
+					expanded: {
+						namespace: "document"
+						object_id: "testdoc"
+						relation: "viewer"
+					}
+				}
+			}
+			expanded: {
+				namespace: "document"
+				object_id: "testdoc"
+				relation: "viewer"
+			}
+			`,
+		},
+		{
+			"shallow caveated arrow",
+			`
+			definition user {}
+
+			caveat somecaveat(somecondition int) {
+				somecondition == 42
+			}
+
+			caveat anothercaveat(somecondition int) {
+				somecondition != 42
+			}
+
+			caveat orgcaveat(somecondition int) {
+				somecondition < 42
+			}
+
+			definition organization {
+				relation admin: user | user with orgcaveat
+			}
+
+			definition document {
+				relation org: organization with somecaveat
+				relation viewer: user
+				permission view = viewer + org->admin
+			}
+			`,
+			[]tuple.Relationship{
+				tuple.MustParse("document:testdoc#viewer@user:tom"),
+				tuple.MustParse("document:testdoc#viewer@user:fred[anothercaveat]"),
+				tuple.MustParse("document:testdoc#org@organization:someorg[somecaveat]"),
+				tuple.MustParse("organization:someorg#admin@user:sarah"),
+				tuple.MustParse("organization:someorg#admin@user:mary[orgcaveat]"),
+			},
+			tuple.MustParseONR("document:testdoc#view"),
+			v1.DispatchExpandRequest_SHALLOW,
+			`
+			intermediate_node:  {
+				operation:  UNION
+				child_nodes:  {
+					leaf_node:  {
+						subjects:  {
+							subject:  {
+								namespace:  "user"
+								object_id:  "fred"
+								relation:  "..."
+							}
+							caveat_expression:  {
+								caveat:  {
+									caveat_name:  "anothercaveat"
+									context:  {}
+								}
+							}
+						}
+						subjects:  {
+							subject:  {
+								namespace:  "user"
+								object_id:  "tom"
+								relation:  "..."
+							}
+						}
+					}
+					expanded:  {
+						namespace:  "document"
+						object_id:  "testdoc"
+						relation:  "viewer"
+					}
+				}
+				child_nodes:  {
+					intermediate_node:  {
+						operation:  UNION
+						child_nodes:  {
+							leaf_node:  {
+								subjects:  {
+									subject:  {
+										namespace:  "user"
+										object_id:  "mary"
+										relation:  "..."
+									}
+									caveat_expression:  {
+										caveat:  {
+											caveat_name:  "orgcaveat"
+											context:  {}
+										}
+									}
+								}
+								subjects:  {
+									subject:  {
+										namespace:  "user"
+										object_id:  "sarah"
+										relation:  "..."
+									}
+								}
+							}
+							expanded:  {
+								namespace:  "organization"
+								object_id:  "someorg"
+								relation:  "admin"
+							}
+							caveat_expression:  {
+								caveat:  {
+									caveat_name:  "somecaveat"
+									context:  {}
+								}
+							}
+						}
+					}
+					expanded:  {
+						namespace:  "document"
+						object_id:  "testdoc"
+						relation:  "view"
+					}
+				}
+			}
+			expanded:  {
+				namespace:  "document"
+				object_id:  "testdoc"
+				relation:  "view"
+			}
+			`,
+		},
+		{
+			"recursive caveated indirect arrow",
+			`definition user {}
+
+			caveat somecaveat(somecondition int) {
+				somecondition == 42
+			}
+		  
+			definition folder {
+				relation container: folder with somecaveat
+				relation member: user
+				permission view = container->member
+			}
+		  
+			definition resource {
+				relation folder: folder
+				permission view = folder->view
+			}`,
+			[]tuple.Relationship{
+				tuple.MustParse("resource:someresource#folder@folder:first"),
+				tuple.MustParse("folder:first#container@folder:second[somecaveat]"),
+				tuple.MustParse("folder:first#member@user:notreachable"),
+				tuple.MustParse("folder:second#member@user:tom"),
+			},
+			tuple.MustParseONR("resource:someresource#view"),
+			v1.DispatchExpandRequest_RECURSIVE,
+			`
+			intermediate_node: {
+				operation: UNION
+				child_nodes: {
+				  intermediate_node: {
+					operation: UNION
+					child_nodes: {
+					  intermediate_node: {
+						operation: UNION
+						child_nodes: {
+						  intermediate_node: {
+							operation: UNION
+							child_nodes: {
+							  leaf_node: {
+								subjects: {
+								  subject: {
+									namespace: "user"
+									object_id: "tom"
+									relation: "..."
+								  }
+								}
+							  }
+							  expanded: {
+								namespace: "folder"
+								object_id: "second"
+								relation: "member"
+							  }
+							  caveat_expression: {
+								caveat: {
+								  caveat_name: "somecaveat"
+								  context: {}
+								}
+							  }
+							}
+						  }
+						  expanded: {
+							namespace: "folder"
+							object_id: "first"
+							relation: "view"
+						  }
+						}
+					  }
+					  expanded: {
+						namespace: "folder"
+						object_id: "first"
+						relation: "view"
+					  }
+					}
+				  }
+				  expanded: {
+					namespace: "resource"
+					object_id: "someresource"
+					relation: "view"
+				  }
+				}
+			  }
+			  expanded: {
+				namespace: "resource"
+				object_id: "someresource"
+				relation: "view"
+			  }
+			`,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+
+			ctx, dispatch, revision := newLocalDispatcherWithSchemaAndRels(t, tc.schema, tc.relationships)
+
+			expandResult, err := dispatch.DispatchExpand(ctx, &v1.DispatchExpandRequest{
+				ResourceAndRelation: tc.start.ToCoreONR(),
+				Metadata: &v1.ResolverMeta{
+					AtRevision:     revision.String(),
+					DepthRemaining: 50,
+				},
+				ExpansionMode: tc.expansionMode,
+			})
+			require.NoError(err)
+
+			expectedTree := &core.RelationTupleTreeNode{}
+			err = prototext.Unmarshal([]byte(tc.expectedTreeText), expectedTree)
+			require.NoError(err)
+
+			require.NoError(err)
+			require.NotNil(expandResult.TreeNode)
+			testutil.RequireProtoEqual(t, expectedTree, expandResult.TreeNode, "Got different expansion trees")
+		})
+	}
 }

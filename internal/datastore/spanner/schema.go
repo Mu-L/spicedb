@@ -1,9 +1,5 @@
 package spanner
 
-import (
-	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-)
-
 const (
 	tableNamespace     = "namespace_config"
 	colNamespaceName   = "namespace"
@@ -18,23 +14,27 @@ const (
 	colUsersetObjectID  = "userset_object_id"
 	colUsersetRelation  = "userset_relation"
 	colTimestamp        = "timestamp"
+	colCaveatName       = "caveat_name"
+	colCaveatContext    = "caveat_context"
+	colExpiration       = "expires_at"
 
-	tableChangelog            = "changelog"
-	colChangeUUID             = "uuid"
-	colChangeTS               = "timestamp"
-	colChangeOp               = "operation"
-	colChangeNamespace        = "namespace"
-	colChangeObjectID         = "object_id"
-	colChangeRelation         = "relation"
-	colChangeUsersetNamespace = "userset_namespace"
-	colChangeUsersetObjectID  = "userset_object_id"
-	colChangeUsersetRelation  = "userset_relation"
+	tableCaveat         = "caveat"
+	colName             = "name"
+	colCaveatDefinition = "definition"
+	colCaveatTS         = "timestamp"
 
-	colChangeOpCreate = 1
-	colChangeOpTouch  = 2
-	colChangeOpDelete = 3
+	tableMetadata = "metadata"
+	colUniqueID   = "unique_id"
 
-	funcPendingCommitTimestamp = "PENDING_COMMIT_TIMESTAMP()"
+	tableRelationshipCounter     = "relationship_counter"
+	colCounterName               = "name"
+	colCounterSerializedFilter   = "serialized_filter"
+	colCounterCurrentCount       = "current_count"
+	colCounterUpdatedAtTimestamp = "updated_at_timestamp"
+
+	tableTransactionMetadata = "transaction_metadata"
+	colTransactionTag        = "transaction_tag"
+	colMetadata              = "metadata"
 )
 
 var allRelationshipCols = []string{
@@ -45,23 +45,7 @@ var allRelationshipCols = []string{
 	colUsersetObjectID,
 	colUsersetRelation,
 	colTimestamp,
-}
-
-var allChangelogCols = []string{
-	colChangeTS,
-	colChangeUUID,
-	colChangeOp,
-	colChangeNamespace,
-	colChangeObjectID,
-	colChangeRelation,
-	colChangeUsersetNamespace,
-	colChangeUsersetObjectID,
-	colChangeUsersetRelation,
-}
-
-// Both creates and touches are emitted as touched to match other datastores.
-var opMap = map[int64]core.RelationTupleUpdate_Operation{
-	colChangeOpCreate: core.RelationTupleUpdate_TOUCH,
-	colChangeOpTouch:  core.RelationTupleUpdate_TOUCH,
-	colChangeOpDelete: core.RelationTupleUpdate_DELETE,
+	colCaveatName,
+	colCaveatContext,
+	colExpiration,
 }

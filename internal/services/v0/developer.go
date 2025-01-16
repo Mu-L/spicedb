@@ -3,19 +3,15 @@ package v0
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	v0 "github.com/authzed/authzed-go/proto/authzed/api/v0"
 	"github.com/authzed/grpcutil"
-	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/encoding/prototext"
 
-	"github.com/authzed/spicedb/pkg/development"
+	log "github.com/authzed/spicedb/internal/logging"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
 	"github.com/authzed/spicedb/pkg/schemadsl/generator"
-	"github.com/authzed/spicedb/pkg/tuple"
 )
 
 type devServer struct {
@@ -39,31 +35,7 @@ func NewDeveloperServer(store ShareStore) v0.DeveloperServiceServer {
 	}
 }
 
-func (ds *devServer) FormatSchema(ctx context.Context, req *v0.FormatSchemaRequest) (*v0.FormatSchemaResponse, error) {
-	namespaces, devError, err := development.CompileSchema(req.Schema)
-	if err != nil {
-		return nil, err
-	}
-
-	if devError != nil {
-		return &v0.FormatSchemaResponse{
-			Error: devError,
-		}, nil
-	}
-
-	formatted := ""
-	for _, nsDef := range namespaces {
-		source, _ := generator.GenerateSource(nsDef)
-		formatted += source
-		formatted += "\n\n"
-	}
-
-	return &v0.FormatSchemaResponse{
-		FormattedSchema: strings.TrimSpace(formatted),
-	}, nil
-}
-
-func (ds *devServer) UpgradeSchema(ctx context.Context, req *v0.UpgradeSchemaRequest) (*v0.UpgradeSchemaResponse, error) {
+func (ds *devServer) UpgradeSchema(_ context.Context, req *v0.UpgradeSchemaRequest) (*v0.UpgradeSchemaResponse, error) {
 	upgraded, err := upgradeSchema(req.NamespaceConfigs)
 	if err != nil {
 		return &v0.UpgradeSchemaResponse{
@@ -78,7 +50,7 @@ func (ds *devServer) UpgradeSchema(ctx context.Context, req *v0.UpgradeSchemaReq
 	}, nil
 }
 
-func (ds *devServer) Share(ctx context.Context, req *v0.ShareRequest) (*v0.ShareResponse, error) {
+func (ds *devServer) Share(_ context.Context, req *v0.ShareRequest) (*v0.ShareResponse, error) {
 	reference, err := ds.shareStore.StoreShared(SharedDataV2{
 		Version:           sharedDataVersion,
 		Schema:            req.Schema,
@@ -130,134 +102,16 @@ func (ds *devServer) LookupShared(ctx context.Context, req *v0.LookupShareReques
 	}, nil
 }
 
-func (ds *devServer) EditCheck(ctx context.Context, req *v0.EditCheckRequest) (*v0.EditCheckResponse, error) {
-	devContext, devErr, err := development.NewDevContext(ctx, req.Context)
-	if err != nil {
-		return nil, err
-	}
-
-	if devErr != nil {
-		return &v0.EditCheckResponse{
-			RequestErrors: devErr.InputErrors,
-		}, nil
-	}
-	defer devContext.Dispose()
-
-	// Run the checks and store their output.
-	results := make([]*v0.EditCheckResult, 0, len(req.CheckRelationships))
-	for _, checkTpl := range req.CheckRelationships {
-		cr, err := development.RunCheck(
-			devContext,
-			core.ToCoreObjectAndRelation(checkTpl.ObjectAndRelation),
-			core.ToCoreObjectAndRelation(checkTpl.User.GetUserset()),
-		)
-		if err != nil {
-			devErr, wireErr := development.DistinguishGraphError(
-				devContext,
-				err,
-				v0.DeveloperError_CHECK_WATCH,
-				0, 0,
-				tuple.String(core.ToCoreRelationTuple(checkTpl)),
-			)
-			if wireErr != nil {
-				return nil, wireErr
-			}
-
-			results = append(results, &v0.EditCheckResult{
-				Relationship: checkTpl,
-				IsMember:     false,
-				Error:        devErr,
-			})
-			continue
-		}
-
-		results = append(results, &v0.EditCheckResult{
-			Relationship: checkTpl,
-			IsMember:     cr == v1.DispatchCheckResponse_MEMBER,
-		})
-	}
-
-	return &v0.EditCheckResponse{
-		CheckResults: results,
-	}, nil
+func (ds *devServer) EditCheck(_ context.Context, _ *v0.EditCheckRequest) (*v0.EditCheckResponse, error) {
+	return nil, fmt.Errorf("no longer implemented. Please use the WebAssembly development package")
 }
 
-func (ds *devServer) Validate(ctx context.Context, req *v0.ValidateRequest) (*v0.ValidateResponse, error) {
-	devContext, devErrs, err := development.NewDevContext(ctx, req.Context)
-	if err != nil {
-		return nil, err
-	}
+func (ds *devServer) Validate(_ context.Context, _ *v0.ValidateRequest) (*v0.ValidateResponse, error) {
+	return nil, fmt.Errorf("no longer implemented. Please use the WebAssembly development package")
+}
 
-	if devErrs != nil {
-		return &v0.ValidateResponse{
-			RequestErrors: devErrs.InputErrors,
-		}, nil
-	}
-	defer devContext.Dispose()
-
-	// Parse the assertions YAML.
-	assertions, devErr := development.ParseAssertionsYAML(req.AssertionsYaml)
-	if devErr != nil {
-		return &v0.ValidateResponse{
-			RequestErrors: []*v0.DeveloperError{devErr},
-		}, nil
-	}
-
-	// Parse the expected relations YAML.
-	expectedRelationsMap, devErr := development.ParseExpectedRelationsYAML(req.ValidationYaml)
-	if devErr != nil {
-		return &v0.ValidateResponse{
-			RequestErrors: []*v0.DeveloperError{devErr},
-		}, nil
-	}
-
-	// Run assertions.
-	var failures []*v0.DeveloperError
-	assertDevErrs, aerr := development.RunAllAssertions(devContext, assertions)
-	if aerr != nil {
-		return nil, aerr
-	}
-
-	if assertDevErrs != nil {
-		if len(assertDevErrs.InputErrors) > 0 {
-			return &v0.ValidateResponse{
-				RequestErrors: assertDevErrs.InputErrors,
-			}, nil
-		}
-
-		failures = append(failures, assertDevErrs.ValidationErrors...)
-	}
-
-	// Run expected relations validation.
-	membershipSet, erDevErrs, wireErr := development.RunValidation(devContext, expectedRelationsMap)
-	if wireErr != nil {
-		return nil, wireErr
-	}
-
-	if erDevErrs != nil {
-		if len(erDevErrs.InputErrors) > 0 {
-			return &v0.ValidateResponse{
-				RequestErrors: erDevErrs.InputErrors,
-			}, nil
-		}
-
-		failures = append(failures, erDevErrs.ValidationErrors...)
-	}
-
-	// If requested, regenerate the expected relations YAML.
-	updatedValidationYaml := ""
-	if membershipSet != nil && req.UpdateValidationYaml {
-		generatedValidationYaml, gerr := development.GenerateValidation(membershipSet)
-		if gerr != nil {
-			return nil, gerr
-		}
-		updatedValidationYaml = generatedValidationYaml
-	}
-
-	return &v0.ValidateResponse{
-		ValidationErrors:      failures,
-		UpdatedValidationYaml: updatedValidationYaml,
-	}, nil
+func (ds *devServer) FormatSchema(_ context.Context, _ *v0.FormatSchemaRequest) (*v0.FormatSchemaResponse, error) {
+	return nil, fmt.Errorf("no longer implemented. Please use the WebAssembly development package")
 }
 
 func upgradeSchema(configs []string) (string, error) {
@@ -269,7 +123,11 @@ func upgradeSchema(configs []string) (string, error) {
 			return "", fmt.Errorf("could not upgrade schema due to parse error: %w", nerr)
 		}
 
-		generated, _ := generator.GenerateSource(&nsDef)
+		generated, _, err := generator.GenerateSource(&nsDef)
+		if err != nil {
+			return "", err
+		}
+
 		schema += generated
 		schema += "\n\n"
 	}

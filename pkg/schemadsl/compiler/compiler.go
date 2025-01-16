@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 
-	core "github.com/authzed/spicedb/pkg/proto/core/v1"
+	"google.golang.org/protobuf/proto"
+	"k8s.io/utils/strings/slices"
 
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/schemadsl/dslshape"
 	"github.com/authzed/spicedb/pkg/schemadsl/input"
 	"github.com/authzed/spicedb/pkg/schemadsl/parser"
@@ -20,57 +22,108 @@ type InputSchema struct {
 	SchemaString string
 }
 
-// ErrorWithContext defines an error which contains contextual information.
-type ErrorWithContext struct {
-	BaseCompilerError
-	SourceRange     input.SourceRange
-	Source          input.Source
-	ErrorSourceCode string
+// SchemaDefinition represents an object or caveat definition in a schema.
+type SchemaDefinition interface {
+	proto.Message
+
+	GetName() string
 }
 
-// BaseCompilerError defines an error with contains the base message of the issue
-// that occurred.
-type BaseCompilerError struct {
-	error
-	BaseMessage string
+// CompiledSchema is the result of compiling a schema when there are no errors.
+type CompiledSchema struct {
+	// ObjectDefinitions holds the object definitions in the schema.
+	ObjectDefinitions []*core.NamespaceDefinition
+
+	// CaveatDefinitions holds the caveat definitions in the schema.
+	CaveatDefinitions []*core.CaveatDefinition
+
+	// OrderedDefinitions holds the object and caveat definitions in the schema, in the
+	// order in which they were found.
+	OrderedDefinitions []SchemaDefinition
+
+	rootNode *dslNode
+	mapper   input.PositionMapper
 }
 
-type errorWithNode struct {
-	error
-	node *dslNode
+// SourcePositionToRunePosition converts a source position to a rune position.
+func (cs CompiledSchema) SourcePositionToRunePosition(source input.Source, position input.Position) (int, error) {
+	return cs.mapper.LineAndColToRunePosition(position.LineNumber, position.ColumnPosition, source)
 }
 
-// Compile compilers the input schema(s) into a set of namespace definition protos.
-func Compile(schemas []InputSchema, objectTypePrefix *string) ([]*core.NamespaceDefinition, error) {
-	mapper := newPositionMapper(schemas)
+type config struct {
+	skipValidation   bool
+	objectTypePrefix *string
+	allowedFlags     []string
+}
 
-	// Parse and translate the various schemas.
-	definitions := []*core.NamespaceDefinition{}
-	for _, schema := range schemas {
-		root := parser.Parse(createAstNode, schema.Source, schema.SchemaString).(*dslNode)
-		errs := root.FindAll(dslshape.NodeTypeError)
-		if len(errs) > 0 {
-			err := errorNodeToError(errs[0], mapper)
-			return []*core.NamespaceDefinition{}, err
-		}
+func SkipValidation() Option { return func(cfg *config) { cfg.skipValidation = true } }
 
-		translatedDefs, err := translate(translationContext{
-			objectTypePrefix: objectTypePrefix,
-			mapper:           mapper,
-		}, root)
-		if err != nil {
-			var errorWithNode errorWithNode
-			if errors.As(err, &errorWithNode) {
-				err = toContextError(errorWithNode.error.Error(), "", errorWithNode.node, mapper)
-			}
+func ObjectTypePrefix(prefix string) ObjectPrefixOption {
+	return func(cfg *config) { cfg.objectTypePrefix = &prefix }
+}
 
-			return []*core.NamespaceDefinition{}, err
-		}
+func RequirePrefixedObjectType() ObjectPrefixOption {
+	return func(cfg *config) { cfg.objectTypePrefix = nil }
+}
 
-		definitions = append(definitions, translatedDefs...)
+func AllowUnprefixedObjectType() ObjectPrefixOption {
+	return func(cfg *config) { cfg.objectTypePrefix = new(string) }
+}
+
+const expirationFlag = "expiration"
+
+func DisallowExpirationFlag() Option {
+	return func(cfg *config) {
+		cfg.allowedFlags = slices.Filter([]string{}, cfg.allowedFlags, func(s string) bool {
+			return s != expirationFlag
+		})
+	}
+}
+
+type Option func(*config)
+
+type ObjectPrefixOption func(*config)
+
+// Compile compilers the input schema into a set of namespace definition protos.
+func Compile(schema InputSchema, prefix ObjectPrefixOption, opts ...Option) (*CompiledSchema, error) {
+	cfg := &config{
+		allowedFlags: make([]string, 0, 1),
 	}
 
-	return definitions, nil
+	// Enable `expiration` flag by default.
+	cfg.allowedFlags = append(cfg.allowedFlags, expirationFlag)
+
+	prefix(cfg) // required option
+
+	for _, fn := range opts {
+		fn(cfg)
+	}
+
+	mapper := newPositionMapper(schema)
+	root := parser.Parse(createAstNode, schema.Source, schema.SchemaString).(*dslNode)
+	errs := root.FindAll(dslshape.NodeTypeError)
+	if len(errs) > 0 {
+		err := errorNodeToError(errs[0], mapper)
+		return nil, err
+	}
+
+	compiled, err := translate(translationContext{
+		objectTypePrefix: cfg.objectTypePrefix,
+		mapper:           mapper,
+		schemaString:     schema.SchemaString,
+		skipValidate:     cfg.skipValidation,
+		allowedFlags:     cfg.allowedFlags,
+	}, root)
+	if err != nil {
+		var withNodeError withNodeError
+		if errors.As(err, &withNodeError) {
+			err = toContextError(withNodeError.error.Error(), withNodeError.errorSourceCode, withNodeError.node, mapper)
+		}
+
+		return nil, err
+	}
+
+	return compiled, nil
 }
 
 func errorNodeToError(node *dslNode, mapper input.PositionMapper) error {
@@ -112,7 +165,7 @@ func toContextError(errMessage string, errorSourceCode string, node *dslNode, ma
 		return fmt.Errorf("missing source for node: %w", err)
 	}
 
-	return ErrorWithContext{
+	return WithContextError{
 		BaseCompilerError: BaseCompilerError{
 			error:       fmt.Errorf("parse error in %s: %s", formattedRange, errMessage),
 			BaseMessage: errMessage,

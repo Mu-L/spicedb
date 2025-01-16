@@ -1,6 +1,10 @@
 package migrations
 
-import "context"
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5"
+)
 
 const (
 	createNamespaceConfig = `CREATE TABLE namespace_config (
@@ -26,27 +30,12 @@ const (
 
 	insertEmptyVersion = `INSERT INTO schema_version (version_num) VALUES ('');`
 
-	enableRangefeeds = `SET CLUSTER SETTING kv.rangefeed.enabled = true;`
-
 	createReverseQueryIndex = `CREATE INDEX ix_relation_tuple_by_subject ON relation_tuple (userset_object_id, userset_namespace, userset_relation, namespace, relation)`
 	createReverseCheckIndex = `CREATE INDEX ix_relation_tuple_by_subject_relation ON relation_tuple (userset_namespace, userset_relation, namespace, relation)`
 )
 
 func init() {
-	if err := CRDBMigrations.Register("initial", "", func(apd *CRDBDriver) error {
-		ctx := context.Background()
-
-		_, err := apd.db.Exec(ctx, enableRangefeeds)
-		if err != nil {
-			return err
-		}
-
-		tx, err := apd.db.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-
+	if err := CRDBMigrations.Register("initial", "", noNonAtomicMigration, func(ctx context.Context, tx pgx.Tx) error {
 		statements := []string{
 			createNamespaceConfig,
 			createRelationTuple,
@@ -61,8 +50,7 @@ func init() {
 				return err
 			}
 		}
-
-		return tx.Commit(ctx)
+		return nil
 	}); err != nil {
 		panic("failed to register migration: " + err.Error())
 	}

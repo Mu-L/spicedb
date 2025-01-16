@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"cloud.google.com/go/spanner"
-	"google.golang.org/genproto/googleapis/spanner/admin/database/v1"
+	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 )
 
 const (
@@ -28,7 +28,6 @@ const (
 		version_num STRING(1024) NOT NULL
 	) PRIMARY KEY (version_num)`
 
-	// TODO see if we can make the operation smaller
 	createChangelog = `CREATE TABLE changelog (
 		timestamp TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
 		uuid STRING(36) NOT NULL,
@@ -48,11 +47,9 @@ const (
 )
 
 func init() {
-	if err := SpannerMigrations.Register("initial", "", func(smd SpannerMigrationDriver) error {
-		ctx := context.Background()
-
-		updateOp, err := smd.adminClient.UpdateDatabaseDdl(ctx, &database.UpdateDatabaseDdlRequest{
-			Database: smd.client.DatabaseName(),
+	if err := SpannerMigrations.Register("initial", "", func(ctx context.Context, w Wrapper) error {
+		updateOp, err := w.adminClient.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
+			Database: w.client.DatabaseName(),
 			Statements: []string{
 				createNamespaceConfig,
 				createRelationTuple,
@@ -66,15 +63,9 @@ func init() {
 			return err
 		}
 
-		if err := updateOp.Wait(ctx); err != nil {
-			return err
-		}
-
-		_, err = smd.client.ReadWriteTransaction(ctx, func(c context.Context, rwt *spanner.ReadWriteTransaction) error {
-			_, err := rwt.Update(c, spanner.NewStatement(insertEmptyVersion))
-			return err
-		})
-
+		return updateOp.Wait(ctx)
+	}, func(ctx context.Context, rwt *spanner.ReadWriteTransaction) error {
+		_, err := rwt.Update(ctx, spanner.NewStatement(insertEmptyVersion))
 		return err
 	}); err != nil {
 		panic("failed to register migration: " + err.Error())

@@ -6,17 +6,15 @@ import (
 	"sync"
 	"time"
 
-	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
 	"github.com/benbjohnson/clock"
 	"github.com/influxdata/tdigest"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/rs/zerolog/log"
 
+	log "github.com/authzed/spicedb/internal/logging"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-
-	"github.com/authzed/spicedb/internal/datastore"
-	"github.com/authzed/spicedb/internal/datastore/options"
 )
 
 var hedgeableCount = promauto.NewCounter(prometheus.CounterOpts{
@@ -120,7 +118,7 @@ func newHedger(
 }
 
 type hedgingProxy struct {
-	delegate datastore.Datastore
+	datastore.Datastore
 
 	revisionHedger      hedger
 	headRevisionHedger  hedger
@@ -135,7 +133,7 @@ func NewHedgingProxy(
 	initialSlowRequestThreshold time.Duration,
 	maxSampleCount uint64,
 	hedgingQuantile float64,
-) datastore.Datastore {
+) (datastore.Datastore, error) {
 	return newHedgingProxyWithTimeSource(
 		delegate,
 		initialSlowRequestThreshold,
@@ -151,17 +149,17 @@ func newHedgingProxyWithTimeSource(
 	maxSampleCount uint64,
 	hedgingQuantile float64,
 	timeSource clock.Clock,
-) datastore.Datastore {
+) (datastore.Datastore, error) {
 	if initialSlowRequestThreshold < 0 {
-		panic("initial slow request threshold negative")
+		return nil, fmt.Errorf("initial slow request threshold negative")
 	}
 
 	if maxSampleCount < minMaxRequestsThreshold {
-		panic(fmt.Sprintf("maxSampleCount must be >=%d", minMaxRequestsThreshold))
+		return nil, fmt.Errorf("maxSampleCount must be >=%d", minMaxRequestsThreshold)
 	}
 
 	if hedgingQuantile <= 0.0 || hedgingQuantile >= 1.0 {
-		panic("hedingQuantile must be in the range (0.0-1.0) exclusive")
+		return nil, fmt.Errorf("hedgingQuantile must be in the range (0.0-1.0) exclusive")
 	}
 
 	return hedgingProxy{
@@ -170,17 +168,17 @@ func newHedgingProxyWithTimeSource(
 		newHedger(timeSource, initialSlowRequestThreshold, maxSampleCount, hedgingQuantile),
 		newHedger(timeSource, initialSlowRequestThreshold, maxSampleCount, hedgingQuantile),
 		newHedger(timeSource, initialSlowRequestThreshold, maxSampleCount, hedgingQuantile),
-	}
+	}, nil
 }
 
-func (hp hedgingProxy) NamespaceCacheKey(namespaceName string, revision datastore.Revision) (string, error) {
-	return hp.delegate.NamespaceCacheKey(namespaceName, revision)
+func (hp hedgingProxy) Unwrap() datastore.Datastore {
+	return hp.Datastore
 }
 
 func (hp hedgingProxy) OptimizedRevision(ctx context.Context) (rev datastore.Revision, err error) {
 	var once sync.Once
 	subreq := func(ctx context.Context, responseReady chan<- struct{}) {
-		delegatedRev, delegatedErr := hp.delegate.OptimizedRevision(ctx)
+		delegatedRev, delegatedErr := hp.Datastore.OptimizedRevision(ctx)
 		once.Do(func() {
 			rev = delegatedRev
 			err = delegatedErr
@@ -196,7 +194,7 @@ func (hp hedgingProxy) OptimizedRevision(ctx context.Context) (rev datastore.Rev
 func (hp hedgingProxy) HeadRevision(ctx context.Context) (rev datastore.Revision, err error) {
 	var once sync.Once
 	subreq := func(ctx context.Context, responseReady chan<- struct{}) {
-		delegatedRev, delegatedErr := hp.delegate.HeadRevision(ctx)
+		delegatedRev, delegatedErr := hp.Datastore.HeadRevision(ctx)
 		once.Do(func() {
 			rev = delegatedRev
 			err = delegatedErr
@@ -209,10 +207,24 @@ func (hp hedgingProxy) HeadRevision(ctx context.Context) (rev datastore.Revision
 	return
 }
 
-func (hp hedgingProxy) ReadNamespace(ctx context.Context, nsName string, revision datastore.Revision) (ns *core.NamespaceDefinition, createdAt datastore.Revision, err error) {
+func (hp hedgingProxy) SnapshotReader(rev datastore.Revision) datastore.Reader {
+	delegate := hp.Datastore.SnapshotReader(rev)
+	return &hedgingReader{delegate, hp}
+}
+
+type hedgingReader struct {
+	datastore.Reader
+
+	p hedgingProxy
+}
+
+func (hp hedgingReader) ReadNamespaceByName(
+	ctx context.Context,
+	nsName string,
+) (ns *core.NamespaceDefinition, createdAt datastore.Revision, err error) {
 	var once sync.Once
 	subreq := func(ctx context.Context, responseReady chan<- struct{}) {
-		delegatedNs, delegatedRev, delegatedErr := hp.delegate.ReadNamespace(ctx, nsName, revision)
+		delegatedNs, delegatedRev, delegatedErr := hp.Reader.ReadNamespaceByName(ctx, nsName)
 		once.Do(func() {
 			ns = delegatedNs
 			createdAt = delegatedRev
@@ -221,65 +233,35 @@ func (hp hedgingProxy) ReadNamespace(ctx context.Context, nsName string, revisio
 		responseReady <- struct{}{}
 	}
 
-	hp.readNamespaceHedger(ctx, subreq)
+	hp.p.readNamespaceHedger(ctx, subreq)
 
 	return
 }
 
-func (hp hedgingProxy) Close() error {
-	return hp.delegate.Close()
-}
-
-func (hp hedgingProxy) IsReady(ctx context.Context) (bool, error) {
-	return hp.delegate.IsReady(ctx)
-}
-
-func (hp hedgingProxy) DeleteRelationships(ctx context.Context, preconditions []*v1.Precondition, filter *v1.RelationshipFilter) (datastore.Revision, error) {
-	return hp.delegate.DeleteRelationships(ctx, preconditions, filter)
-}
-
-func (hp hedgingProxy) WriteTuples(ctx context.Context, preconditions []*v1.Precondition, updates []*v1.RelationshipUpdate) (datastore.Revision, error) {
-	return hp.delegate.WriteTuples(ctx, preconditions, updates)
-}
-
-func (hp hedgingProxy) Watch(ctx context.Context, afterRevision datastore.Revision) (<-chan *datastore.RevisionChanges, <-chan error) {
-	return hp.delegate.Watch(ctx, afterRevision)
-}
-
-func (hp hedgingProxy) WriteNamespace(ctx context.Context, newConfig *core.NamespaceDefinition) (datastore.Revision, error) {
-	return hp.delegate.WriteNamespace(ctx, newConfig)
-}
-
-func (hp hedgingProxy) DeleteNamespace(ctx context.Context, nsName string) (datastore.Revision, error) {
-	return hp.delegate.DeleteNamespace(ctx, nsName)
-}
-
-func (hp hedgingProxy) QueryTuples(
+func (hp hedgingReader) QueryRelationships(
 	ctx context.Context,
-	filter *v1.RelationshipFilter,
-	revision datastore.Revision,
+	filter datastore.RelationshipsFilter,
 	options ...options.QueryOptionsOption,
-) (iter datastore.TupleIterator, err error) {
-	return hp.executeQuery(ctx, func(c context.Context) (datastore.TupleIterator, error) {
-		return hp.delegate.QueryTuples(ctx, filter, revision, options...)
+) (iter datastore.RelationshipIterator, err error) {
+	return hp.executeQuery(ctx, func(c context.Context) (datastore.RelationshipIterator, error) {
+		return hp.Reader.QueryRelationships(ctx, filter, options...)
 	})
 }
 
-func (hp hedgingProxy) ReverseQueryTuples(
+func (hp hedgingReader) ReverseQueryRelationships(
 	ctx context.Context,
-	subjectFilter *v1.SubjectFilter,
-	revision datastore.Revision,
+	subjectsFilter datastore.SubjectsFilter,
 	opts ...options.ReverseQueryOptionsOption,
-) (iter datastore.TupleIterator, err error) {
-	return hp.executeQuery(ctx, func(c context.Context) (datastore.TupleIterator, error) {
-		return hp.delegate.ReverseQueryTuples(ctx, subjectFilter, revision, opts...)
+) (iter datastore.RelationshipIterator, err error) {
+	return hp.executeQuery(ctx, func(c context.Context) (datastore.RelationshipIterator, error) {
+		return hp.Reader.ReverseQueryRelationships(ctx, subjectsFilter, opts...)
 	})
 }
 
-func (hp hedgingProxy) executeQuery(
+func (hp hedgingReader) executeQuery(
 	ctx context.Context,
-	exec func(context.Context) (datastore.TupleIterator, error),
-) (delegateIterator datastore.TupleIterator, err error) {
+	exec func(context.Context) (datastore.RelationshipIterator, error),
+) (delegateIterator datastore.RelationshipIterator, err error) {
 	var once sync.Once
 	subreq := func(ctx context.Context, responseReady chan<- struct{}) {
 		tempIterator, tempErr := exec(ctx)
@@ -293,20 +275,14 @@ func (hp hedgingProxy) executeQuery(
 		// only the first call to once.Do will run the function, so whichever
 		// hedged request is slower will have resultsUsed = false
 		if !resultsUsed && tempErr == nil {
-			tempIterator.Close()
+			for range tempIterator {
+				break
+			}
 		}
 		responseReady <- struct{}{}
 	}
 
-	hp.queryTuplesHedger(ctx, subreq)
+	hp.p.queryTuplesHedger(ctx, subreq)
 
 	return
-}
-
-func (hp hedgingProxy) CheckRevision(ctx context.Context, revision datastore.Revision) error {
-	return hp.delegate.CheckRevision(ctx, revision)
-}
-
-func (hp hedgingProxy) ListNamespaces(ctx context.Context, revision datastore.Revision) ([]*core.NamespaceDefinition, error) {
-	return hp.delegate.ListNamespaces(ctx, revision)
 }

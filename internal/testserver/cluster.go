@@ -8,19 +8,20 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
-	"github.com/cespare/xxhash"
+	"github.com/authzed/consistent"
+	"github.com/cespare/xxhash/v2"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/resolver"
 
-	"github.com/authzed/spicedb/internal/datastore"
 	combineddispatch "github.com/authzed/spicedb/internal/dispatch/combined"
-	"github.com/authzed/spicedb/internal/namespace"
-	hashbalancer "github.com/authzed/spicedb/pkg/balancer"
 	"github.com/authzed/spicedb/pkg/cmd/server"
 	"github.com/authzed/spicedb/pkg/cmd/util"
+	"github.com/authzed/spicedb/pkg/datastore"
 	"github.com/authzed/spicedb/pkg/secrets"
 )
 
@@ -57,7 +58,7 @@ var testResolverBuilder = &SafeManualResolverBuilder{}
 
 func init() {
 	// register hashring balancer
-	balancer.Register(hashbalancer.NewConsistentHashringBuilder(xxhash.Sum64, 20, 1))
+	balancer.Register(consistent.NewBuilder(xxhash.Sum64))
 
 	// Register a manual resolver.Builder  that we can feed addresses for tests
 	// Registration is not thread safe, so we register a single resolver.Builder
@@ -122,7 +123,7 @@ type SafeManualResolver struct {
 
 // ResolveNow implements the resolver.Resolver interface
 // It sends the static list of addresses to the underlying resolver.ClientConn
-func (r *SafeManualResolver) ResolveNow(options resolver.ResolveNowOptions) {
+func (r *SafeManualResolver) ResolveNow(_ resolver.ResolveNowOptions) {
 	if r.cc == nil {
 		return
 	}
@@ -136,7 +137,12 @@ func (r *SafeManualResolver) Close() {}
 
 // TestClusterWithDispatch creates a cluster with `size` nodes
 // The cluster has a real dispatch stack that uses bufconn grpc connections
-func TestClusterWithDispatch(t testing.TB, size uint, ds datastore.Datastore) ([]*grpc.ClientConn, func()) {
+func TestClusterWithDispatch(t testing.TB, size uint, ds datastore.Datastore, additionalServerOptions ...server.ConfigOption) ([]*grpc.ClientConn, func()) {
+	return TestClusterWithDispatchAndCacheConfig(t, size, ds, additionalServerOptions...)
+}
+
+// TestClusterWithDispatchAndCacheConfig creates a cluster with `size` nodes and with cache toggled.
+func TestClusterWithDispatchAndCacheConfig(t testing.TB, size uint, ds datastore.Datastore, additionalServerOptions ...server.ConfigOption) ([]*grpc.ClientConn, func()) {
 	// each cluster gets a unique prefix since grpc resolution is process-global
 	prefix := getPrefix(t)
 
@@ -155,14 +161,15 @@ func TestClusterWithDispatch(t testing.TB, size uint, ds datastore.Datastore) ([
 	cancelFuncs := make([]func(), 0, size)
 
 	for i := uint(0); i < size; i++ {
-		nsm, err := namespace.NewCachingNamespaceManager(nil)
-		require.NoError(t, err)
-
-		dispatcher, err := combineddispatch.NewDispatcher(nsm,
-			combineddispatch.UpstreamAddr("test://"+prefix),
+		dispatcherOptions := []combineddispatch.Option{
+			combineddispatch.UpstreamAddr("test://" + prefix),
 			combineddispatch.PrometheusSubsystem(fmt.Sprintf("%s_%d_client_dispatch", prefix, i)),
 			combineddispatch.GrpcDialOpts(
-				grpc.WithDefaultServiceConfig(hashbalancer.BalancerServiceConfig),
+				grpc.WithDefaultServiceConfig(
+					(&consistent.BalancerConfig{
+						ReplicationFactor: 1500,
+						Spread:            1,
+					}).MustServiceConfigJSON()),
 				grpc.WithContextDialer(func(ctx context.Context, s string) (net.Conn, error) {
 					// it's possible grpc tries to dial before we have set the
 					// buffconn dialers, we have to return a "TempError" so that
@@ -177,41 +184,58 @@ func TestClusterWithDispatch(t testing.TB, size uint, ds datastore.Datastore) ([
 					return dialers[i](ctx, s)
 				}),
 			),
-		)
+		}
+
+		dispatcher, err := combineddispatch.NewDispatcher(dispatcherOptions...)
 		require.NoError(t, err)
 
-		srv, err := server.NewConfigWithOptions(
+		serverOptions := []server.ConfigOption{
 			server.WithDatastore(ds),
 			server.WithDispatcher(dispatcher),
-			server.WithNamespaceManager(nsm),
 			server.WithDispatchMaxDepth(50),
+			server.WithMaximumPreconditionCount(1000),
+			server.WithMaximumUpdatesPerWrite(1000),
 			server.WithGRPCServer(util.GRPCServerConfig{
 				Network: util.BufferedNetwork,
 				Enabled: true,
 			}),
+			server.WithMaxRelationshipContextSize(25000),
 			server.WithSchemaPrefixesRequired(false),
 			server.WithGRPCAuthFunc(func(ctx context.Context) (context.Context, error) {
 				return ctx, nil
 			}),
-			server.WithHTTPGateway(util.HTTPServerConfig{Enabled: false}),
-			server.WithDashboardAPI(util.HTTPServerConfig{Enabled: false}),
-			server.WithMetricsAPI(util.HTTPServerConfig{Enabled: false}),
+			server.WithHTTPGateway(util.HTTPServerConfig{HTTPEnabled: false}),
+			server.WithMetricsAPI(util.HTTPServerConfig{HTTPEnabled: false}),
 			server.WithDispatchServer(util.GRPCServerConfig{
 				Enabled: true,
 				Network: util.BufferedNetwork,
 			}),
 			server.WithDispatchClusterMetricsPrefix(fmt.Sprintf("%s_%d_dispatch", prefix, i)),
-		).Complete()
-		require.NoError(t, err)
+		}
+		serverOptions = append(serverOptions, additionalServerOptions...)
 
 		ctx, cancel := context.WithCancel(context.Background())
+		srv, err := server.NewConfigWithOptionsAndDefaults(serverOptions...).Complete(ctx)
+		require.NoError(t, err)
+
 		go func() {
 			require.NoError(t, srv.Run(ctx))
 		}()
 		cancelFuncs = append(cancelFuncs, cancel)
 
 		dialers = append(dialers, srv.DispatchNetDialContext)
-		conn, err := srv.GRPCDialContext(ctx, grpc.WithBlock())
+
+		// TODO: move off of WithBlock and WithReturnConnectionError
+		conn, err := srv.GRPCDialContext(ctx,
+			grpc.WithReturnConnectionError(), // nolint: staticcheck
+			grpc.WithBlock(),                 // nolint: staticcheck
+			grpc.WithConnectParams(grpc.ConnectParams{
+				Backoff: backoff.Config{
+					BaseDelay:  1 * time.Second,
+					Multiplier: 2,
+					MaxDelay:   15 * time.Second,
+				},
+			}))
 		require.NoError(t, err)
 		conns = append(conns, conn)
 	}

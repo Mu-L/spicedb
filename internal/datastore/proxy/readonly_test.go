@@ -2,75 +2,75 @@ package proxy
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
-	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
-	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	"github.com/authzed/spicedb/internal/datastore/common"
+	"github.com/authzed/spicedb/internal/datastore/proxy/proxy_test"
+	"github.com/authzed/spicedb/internal/datastore/revisions"
+	"github.com/authzed/spicedb/pkg/datastore"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-
-	"github.com/authzed/spicedb/internal/datastore"
-	"github.com/authzed/spicedb/internal/datastore/options"
+	"github.com/authzed/spicedb/pkg/tuple"
 )
+
+func newReadOnlyMock() (*proxy_test.MockDatastore, *proxy_test.MockReader) {
+	dsMock := &proxy_test.MockDatastore{}
+	readerMock := &proxy_test.MockReader{}
+
+	dsMock.On("ReadWriteTx").Panic("read-only proxy should never open a read-write transaction").Maybe()
+	dsMock.On("SnapshotReader", mock.Anything).Return(readerMock).Maybe()
+
+	return dsMock, readerMock
+}
 
 func TestRWOperationErrors(t *testing.T) {
 	require := require.New(t)
 
-	ds := NewReadonlyDatastore(&delegateMock{})
-	ctx := context.Background()
+	delegate, _ := newReadOnlyMock()
 
-	rev, err := ds.DeleteNamespace(ctx, "fake")
-	require.ErrorAs(err, &datastore.ErrReadOnly{})
-	require.Equal(datastore.NoRevision, rev)
-
-	rev, err = ds.WriteNamespace(ctx, &core.NamespaceDefinition{Name: "user"})
-	require.ErrorAs(err, &datastore.ErrReadOnly{})
-	require.Equal(datastore.NoRevision, rev)
-
-	rev, err = ds.WriteTuples(ctx, nil, []*v1.RelationshipUpdate{{
-		Operation: v1.RelationshipUpdate_OPERATION_CREATE,
-		Relationship: &v1.Relationship{
-			Resource: &v1.ObjectReference{
-				ObjectType: "user",
-				ObjectId:   "test",
-			},
-			Relation: "boss",
-			Subject: &v1.SubjectReference{
-				Object: &v1.ObjectReference{
-					ObjectType: "user",
-					ObjectId:   "boss",
-				},
-			},
-		},
-	}})
-	require.ErrorAs(err, &datastore.ErrReadOnly{})
-	require.Equal(datastore.NoRevision, rev)
-}
-
-var expectedRevision = decimal.NewFromInt(123)
-
-func TestIsReadyPassthrough(t *testing.T) {
-	require := require.New(t)
-
-	delegate := &delegateMock{}
 	ds := NewReadonlyDatastore(delegate)
 	ctx := context.Background()
 
-	delegate.On("IsReady").Return(true, nil).Times(1)
+	rev, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		return rwt.DeleteNamespaces(ctx, "fake")
+	})
+	require.ErrorAs(err, &datastore.ReadOnlyError{})
+	require.Equal(datastore.NoRevision, rev)
 
-	resp, err := ds.IsReady(ctx)
+	rev, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		return rwt.WriteNamespaces(ctx, &core.NamespaceDefinition{Name: "user"})
+	})
+	require.ErrorAs(err, &datastore.ReadOnlyError{})
+	require.Equal(datastore.NoRevision, rev)
+
+	rev, err = common.WriteRelationships(ctx, ds, tuple.UpdateOperationCreate, tuple.MustParse("user:test#boss@user:boss"))
+	require.ErrorAs(err, &datastore.ReadOnlyError{})
+	require.Equal(datastore.NoRevision, rev)
+}
+
+var expectedRevision = revisions.NewForTransactionID(123)
+
+func TestReadyStatePassthrough(t *testing.T) {
+	require := require.New(t)
+
+	delegate, _ := newReadOnlyMock()
+	ds := NewReadonlyDatastore(delegate)
+	ctx := context.Background()
+
+	delegate.On("ReadyState").Return(datastore.ReadyState{IsReady: true}, nil).Times(1)
+
+	resp, err := ds.ReadyState(ctx)
 	require.NoError(err)
-	require.True(resp)
+	require.True(resp.IsReady)
 	delegate.AssertExpectations(t)
 }
 
-func TestRevisionPassthrough(t *testing.T) {
+func TestOptimizedRevisionPassthrough(t *testing.T) {
 	require := require.New(t)
 
-	delegate := &delegateMock{}
+	delegate, _ := newReadOnlyMock()
 	ds := NewReadonlyDatastore(delegate)
 	ctx := context.Background()
 
@@ -85,7 +85,7 @@ func TestRevisionPassthrough(t *testing.T) {
 func TestHeadRevisionPassthrough(t *testing.T) {
 	require := require.New(t)
 
-	delegate := &delegateMock{}
+	delegate, _ := newReadOnlyMock()
 	ds := NewReadonlyDatastore(delegate)
 	ctx := context.Background()
 
@@ -100,7 +100,7 @@ func TestHeadRevisionPassthrough(t *testing.T) {
 func TestCheckRevisionPassthrough(t *testing.T) {
 	require := require.New(t)
 
-	delegate := &delegateMock{}
+	delegate, _ := newReadOnlyMock()
 	ds := NewReadonlyDatastore(delegate)
 	ctx := context.Background()
 
@@ -112,7 +112,7 @@ func TestCheckRevisionPassthrough(t *testing.T) {
 }
 
 func TestWatchPassthrough(t *testing.T) {
-	delegate := &delegateMock{}
+	delegate, _ := newReadOnlyMock()
 	ds := NewReadonlyDatastore(delegate)
 	ctx := context.Background()
 
@@ -121,164 +121,22 @@ func TestWatchPassthrough(t *testing.T) {
 		make(<-chan error),
 	).Times(1)
 
-	ds.Watch(ctx, expectedRevision)
+	ds.Watch(ctx, expectedRevision, datastore.WatchJustRelationships())
 	delegate.AssertExpectations(t)
 }
 
-func TestReadNamespacePassthrough(t *testing.T) {
+func TestSnapshotReaderPassthrough(t *testing.T) {
 	require := require.New(t)
 
-	delegate := &delegateMock{}
+	delegate, reader := newReadOnlyMock()
 	ds := NewReadonlyDatastore(delegate)
 	ctx := context.Background()
 
-	delegate.On("ReadNamespace", "test", expectedRevision).Return(&core.NamespaceDefinition{}, expectedRevision, nil).Times(1)
+	reader.On("ReadNamespaceByName", "fake").Return(nil, expectedRevision, nil).Times(1)
 
-	ns, revision, err := ds.ReadNamespace(ctx, "test", expectedRevision)
-	require.Equal(&core.NamespaceDefinition{}, ns)
-	require.Equal(expectedRevision, revision)
+	_, rev, err := ds.SnapshotReader(expectedRevision).ReadNamespaceByName(ctx, "fake")
 	require.NoError(err)
+	require.True(expectedRevision.Equal(rev))
 	delegate.AssertExpectations(t)
-}
-
-func TestQueryTuplesPassthrough(t *testing.T) {
-	require := require.New(t)
-
-	delegate := &delegateMock{}
-	ds := NewReadonlyDatastore(delegate)
-	ctx := context.Background()
-
-	delegate.On("QueryTuples", &v1.RelationshipFilter{ResourceType: "test"}, expectedRevision).Return().Times(1)
-
-	iter, err := ds.QueryTuples(ctx, &v1.RelationshipFilter{ResourceType: "test"}, expectedRevision)
-	require.Nil(iter)
-	require.NoError(err)
-	delegate.AssertExpectations(t)
-}
-
-func TestReverseQueryTuplesPassthrough(t *testing.T) {
-	require := require.New(t)
-
-	delegate := &delegateMock{}
-	ds := NewReadonlyDatastore(delegate)
-	ctx := context.Background()
-
-	delegate.On("ReverseQueryTuples", &v1.SubjectFilter{SubjectType: "test"}, expectedRevision).Return().Times(1)
-
-	iter, err := ds.ReverseQueryTuples(ctx, &v1.SubjectFilter{SubjectType: "test"}, expectedRevision)
-	require.Nil(iter)
-	require.NoError(err)
-	delegate.AssertExpectations(t)
-}
-
-func TestListNamespacesPassthrough(t *testing.T) {
-	require := require.New(t)
-
-	delegate := &delegateMock{}
-	ds := NewReadonlyDatastore(delegate)
-	ctx := context.Background()
-
-	delegate.On("ListNamespaces", expectedRevision).Return([]*core.NamespaceDefinition{}, nil).Times(1)
-
-	nsDefs, err := ds.ListNamespaces(ctx, expectedRevision)
-	require.Equal([]*core.NamespaceDefinition{}, nsDefs)
-	require.NoError(err)
-	delegate.AssertExpectations(t)
-}
-
-type delegateMock struct {
-	mock.Mock
-}
-
-func (dm *delegateMock) WriteTuples(ctx context.Context, _ []*v1.Precondition, _ []*v1.RelationshipUpdate) (datastore.Revision, error) {
-	panic("shouldn't ever call write method on delegate")
-}
-
-func (dm *delegateMock) DeleteRelationships(ctx context.Context, _ []*v1.Precondition, _ *v1.RelationshipFilter) (datastore.Revision, error) {
-	panic("shouldn't ever call delete relationships method on delegate")
-}
-
-func (dm *delegateMock) OptimizedRevision(ctx context.Context) (datastore.Revision, error) {
-	args := dm.Called()
-	return args.Get(0).(datastore.Revision), args.Error(1)
-}
-
-func (dm *delegateMock) HeadRevision(ctx context.Context) (datastore.Revision, error) {
-	args := dm.Called()
-	return args.Get(0).(datastore.Revision), args.Error(1)
-}
-
-func (dm *delegateMock) Watch(ctx context.Context, afterRevision datastore.Revision) (<-chan *datastore.RevisionChanges, <-chan error) {
-	args := dm.Called(afterRevision)
-
-	return args.Get(0).(<-chan *datastore.RevisionChanges), args.Get(1).(<-chan error)
-}
-
-func (dm *delegateMock) WriteNamespace(ctx context.Context, newConfig *core.NamespaceDefinition) (datastore.Revision, error) {
-	panic("shouldn't ever call write method on delegate")
-}
-
-func (dm *delegateMock) ReadNamespace(ctx context.Context, nsName string, revision datastore.Revision) (*core.NamespaceDefinition, datastore.Revision, error) {
-	args := dm.Called(nsName, revision)
-	return args.Get(0).(*core.NamespaceDefinition), args.Get(1).(datastore.Revision), args.Error(2)
-}
-
-func (dm *delegateMock) DeleteNamespace(ctx context.Context, nsName string) (datastore.Revision, error) {
-	panic("shouldn't ever call write method on delegate")
-}
-
-func (dm *delegateMock) QueryTuples(
-	ctx context.Context,
-	filter *v1.RelationshipFilter,
-	revision datastore.Revision,
-	options ...options.QueryOptionsOption,
-) (datastore.TupleIterator, error) {
-	args := make([]interface{}, 0, len(options)+2)
-	args = append(args, filter, revision)
-	for _, option := range options {
-		args = append(args, option)
-	}
-
-	dm.Called(args...)
-	return nil, nil
-}
-
-func (dm *delegateMock) ReverseQueryTuples(
-	ctx context.Context,
-	subjectFilter *v1.SubjectFilter,
-	revision datastore.Revision,
-	options ...options.ReverseQueryOptionsOption,
-) (datastore.TupleIterator, error) {
-	args := make([]interface{}, 0, len(options)+2)
-	args = append(args, subjectFilter, revision)
-	for _, option := range options {
-		args = append(args, option)
-	}
-
-	dm.Called(args...)
-	return nil, nil
-}
-
-func (dm *delegateMock) CheckRevision(ctx context.Context, revision datastore.Revision) error {
-	args := dm.Called(revision)
-	return args.Error(0)
-}
-
-func (dm *delegateMock) ListNamespaces(ctx context.Context, revision datastore.Revision) ([]*core.NamespaceDefinition, error) {
-	args := dm.Called(revision)
-	return args.Get(0).([]*core.NamespaceDefinition), args.Error(1)
-}
-
-func (dm *delegateMock) IsReady(ctx context.Context) (bool, error) {
-	args := dm.Called()
-	return args.Bool(0), args.Error(1)
-}
-
-func (dm *delegateMock) NamespaceCacheKey(namespaceName string, revision datastore.Revision) (string, error) {
-	return fmt.Sprintf("%s@%s", namespaceName, revision), nil
-}
-
-func (dm *delegateMock) Close() error {
-	args := dm.Called()
-	return args.Error(0)
+	reader.AssertExpectations(t)
 }

@@ -1,3 +1,6 @@
+//go:build docker
+// +build docker
+
 package datastore
 
 import (
@@ -8,31 +11,42 @@ import (
 	"time"
 
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
+	adminpb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instances "cloud.google.com/go/spanner/admin/instance/apiv1"
+	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
+	"github.com/google/uuid"
 	"github.com/ory/dockertest/v3"
+	"github.com/ory/dockertest/v3/docker"
 	"github.com/stretchr/testify/require"
-	adminpb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
-	"google.golang.org/genproto/googleapis/spanner/admin/instance/v1"
 
-	"github.com/authzed/spicedb/internal/datastore"
 	"github.com/authzed/spicedb/internal/datastore/spanner/migrations"
+	"github.com/authzed/spicedb/pkg/datastore"
 	"github.com/authzed/spicedb/pkg/migrate"
 	"github.com/authzed/spicedb/pkg/secrets"
 )
 
-var spannerContainer = &dockertest.RunOptions{
-	Repository: "gcr.io/cloud-spanner-emulator/emulator",
-	Tag:        "latest",
+type spannerTest struct {
+	hostname        string
+	targetMigration string
 }
 
-type spannerDSBuilder struct{}
-
-// NewSpannerBuilder returns a TestDatastoreBuilder for spanner
-func NewSpannerBuilder(t testing.TB) TestDatastoreBuilder {
+// RunSpannerForTesting returns a RunningEngineForTest for spanner
+func RunSpannerForTesting(t testing.TB, bridgeNetworkName string, targetMigration string) RunningEngineForTest {
 	pool, err := dockertest.NewPool("")
 	require.NoError(t, err)
 
-	resource, err := pool.RunWithOptions(spannerContainer)
+	name := fmt.Sprintf("spanner-%s", uuid.New().String())
+	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
+		Name:         name,
+		Repository:   "gcr.io/cloud-spanner-emulator/emulator",
+		Tag:          "1.5.11",
+		ExposedPorts: []string{"9010/tcp"},
+		NetworkID:    bridgeNetworkName,
+	}, func(config *docker.HostConfig) {
+		// set AutoRemove to true so that stopped container goes away by itself
+		config.AutoRemove = true
+		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
+	})
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -44,7 +58,8 @@ func NewSpannerBuilder(t testing.TB) TestDatastoreBuilder {
 	require.NoError(t, os.Setenv("SPANNER_EMULATOR_HOST", spannerEmulatorAddr))
 
 	require.NoError(t, pool.Retry(func() error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), dockerBootTimeout)
+		defer cancel()
 
 		instancesClient, err := instances.NewInstanceAdminClient(ctx)
 		if err != nil {
@@ -52,10 +67,12 @@ func NewSpannerBuilder(t testing.TB) TestDatastoreBuilder {
 		}
 		defer func() { require.NoError(t, instancesClient.Close()) }()
 
-		_, err = instancesClient.CreateInstance(ctx, &instance.CreateInstanceRequest{
+		ctx, cancel = context.WithTimeout(context.Background(), dockerBootTimeout)
+		defer cancel()
+		_, err = instancesClient.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
 			Parent:     "projects/fake-project-id",
 			InstanceId: "init",
-			Instance: &instance.Instance{
+			Instance: &instancepb.Instance{
 				Config:      "emulator-config",
 				DisplayName: "Test Instance",
 				NodeCount:   1,
@@ -64,10 +81,21 @@ func NewSpannerBuilder(t testing.TB) TestDatastoreBuilder {
 		return err
 	}))
 
-	return &spannerDSBuilder{}
+	builder := &spannerTest{
+		targetMigration: targetMigration,
+	}
+	if bridgeNetworkName != "" {
+		builder.hostname = name
+	}
+
+	return builder
 }
 
-func (b *spannerDSBuilder) NewDatastore(t testing.TB, initFunc InitFunc) datastore.Datastore {
+func (b *spannerTest) ExternalEnvVars() []string {
+	return []string{fmt.Sprintf("SPANNER_EMULATOR_HOST=%s:9010", b.hostname)}
+}
+
+func (b *spannerTest) NewDatabase(t testing.TB) string {
 	t.Logf("using spanner emulator, host: %s", os.Getenv("SPANNER_EMULATOR_HOST"))
 
 	uniquePortion, err := secrets.TokenHex(4)
@@ -82,10 +110,10 @@ func (b *spannerDSBuilder) NewDatastore(t testing.TB, initFunc InitFunc) datasto
 	require.NoError(t, err)
 	defer instancesClient.Close()
 
-	createInstanceOp, err := instancesClient.CreateInstance(ctx, &instance.CreateInstanceRequest{
+	createInstanceOp, err := instancesClient.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
 		Parent:     "projects/fake-project-id",
 		InstanceId: newInstanceName,
-		Instance: &instance.Instance{
+		Instance: &instancepb.Instance{
 			Config:      "emulator-config",
 			DisplayName: "Test Instance",
 			NodeCount:   1,
@@ -109,12 +137,17 @@ func (b *spannerDSBuilder) NewDatastore(t testing.TB, initFunc InitFunc) datasto
 
 	db, err := op.Wait(ctx)
 	require.NoError(t, err)
+	return db.Name
+}
 
-	migrationDriver, err := migrations.NewSpannerDriver(db.Name, "")
+func (b *spannerTest) NewDatastore(t testing.TB, initFunc InitFunc) datastore.Datastore {
+	db := b.NewDatabase(t)
+
+	migrationDriver, err := migrations.NewSpannerDriver(context.Background(), db, "", os.Getenv("SPANNER_EMULATOR_HOST"))
 	require.NoError(t, err)
 
-	err = migrations.SpannerMigrations.Run(migrationDriver, migrate.Head, migrate.LiveRun)
+	err = migrations.SpannerMigrations.Run(context.Background(), migrationDriver, b.targetMigration, migrate.LiveRun)
 	require.NoError(t, err)
 
-	return initFunc("spanner", db.Name)
+	return initFunc("spanner", db)
 }

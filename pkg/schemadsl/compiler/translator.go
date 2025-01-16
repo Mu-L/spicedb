@@ -3,13 +3,17 @@ package compiler
 import (
 	"bufio"
 	"fmt"
+	"slices"
 	"strings"
 
+	"github.com/ccoveille/go-safecast"
 	"github.com/jzelinskie/stringz"
 
-	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-
+	"github.com/authzed/spicedb/pkg/caveats"
+	caveattypes "github.com/authzed/spicedb/pkg/caveats/types"
+	"github.com/authzed/spicedb/pkg/genutil/mapz"
 	"github.com/authzed/spicedb/pkg/namespace"
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	"github.com/authzed/spicedb/pkg/schemadsl/dslshape"
 	"github.com/authzed/spicedb/pkg/schemadsl/input"
 )
@@ -17,16 +21,19 @@ import (
 type translationContext struct {
 	objectTypePrefix *string
 	mapper           input.PositionMapper
+	schemaString     string
+	skipValidate     bool
+	allowedFlags     []string
 }
 
-func (tctx translationContext) namespacePath(namespaceName string) (string, error) {
+func (tctx translationContext) prefixedPath(definitionName string) (string, error) {
 	var prefix, name string
-	if err := stringz.SplitExact(namespaceName, "/", &prefix, &name); err != nil {
+	if err := stringz.SplitInto(definitionName, "/", &prefix, &name); err != nil {
 		if tctx.objectTypePrefix == nil {
-			return "", fmt.Errorf("found reference `%s` without prefix", namespaceName)
+			return "", fmt.Errorf("found reference `%s` without prefix", definitionName)
 		}
 		prefix = *tctx.objectTypePrefix
-		name = namespaceName
+		name = definitionName
 	}
 
 	if prefix == "" {
@@ -38,24 +45,166 @@ func (tctx translationContext) namespacePath(namespaceName string) (string, erro
 
 const Ellipsis = "..."
 
-func translate(tctx translationContext, root *dslNode) ([]*core.NamespaceDefinition, error) {
-	definitions := []*core.NamespaceDefinition{}
+func translate(tctx translationContext, root *dslNode) (*CompiledSchema, error) {
+	orderedDefinitions := make([]SchemaDefinition, 0, len(root.GetChildren()))
+	var objectDefinitions []*core.NamespaceDefinition
+	var caveatDefinitions []*core.CaveatDefinition
+
+	names := mapz.NewSet[string]()
+
 	for _, definitionNode := range root.GetChildren() {
-		definition, err := translateDefinition(tctx, definitionNode)
-		if err != nil {
-			return []*core.NamespaceDefinition{}, err
+		var definition SchemaDefinition
+
+		switch definitionNode.GetType() {
+		case dslshape.NodeTypeUseFlag:
+			// Skip the flags.
+			continue
+
+		case dslshape.NodeTypeCaveatDefinition:
+			def, err := translateCaveatDefinition(tctx, definitionNode)
+			if err != nil {
+				return nil, err
+			}
+
+			definition = def
+			caveatDefinitions = append(caveatDefinitions, def)
+
+		case dslshape.NodeTypeDefinition:
+			def, err := translateObjectDefinition(tctx, definitionNode)
+			if err != nil {
+				return nil, err
+			}
+
+			definition = def
+			objectDefinitions = append(objectDefinitions, def)
 		}
 
-		definitions = append(definitions, definition)
+		if !names.Add(definition.GetName()) {
+			return nil, definitionNode.WithSourceErrorf(definition.GetName(), "found name reused between multiple definitions and/or caveats: %s", definition.GetName())
+		}
+
+		orderedDefinitions = append(orderedDefinitions, definition)
 	}
 
-	return definitions, nil
+	return &CompiledSchema{
+		CaveatDefinitions:  caveatDefinitions,
+		ObjectDefinitions:  objectDefinitions,
+		OrderedDefinitions: orderedDefinitions,
+		rootNode:           root,
+		mapper:             tctx.mapper,
+	}, nil
 }
 
-func translateDefinition(tctx translationContext, defNode *dslNode) (*core.NamespaceDefinition, error) {
+func translateCaveatDefinition(tctx translationContext, defNode *dslNode) (*core.CaveatDefinition, error) {
+	definitionName, err := defNode.GetString(dslshape.NodeCaveatDefinitionPredicateName)
+	if err != nil {
+		return nil, defNode.WithSourceErrorf(definitionName, "invalid definition name: %w", err)
+	}
+
+	// parameters
+	paramNodes := defNode.List(dslshape.NodeCaveatDefinitionPredicateParameters)
+	if len(paramNodes) == 0 {
+		return nil, defNode.WithSourceErrorf(definitionName, "caveat `%s` must have at least one parameter defined", definitionName)
+	}
+
+	env := caveats.NewEnvironment()
+	parameters := make(map[string]caveattypes.VariableType, len(paramNodes))
+	for _, paramNode := range paramNodes {
+		paramName, err := paramNode.GetString(dslshape.NodeCaveatParameterPredicateName)
+		if err != nil {
+			return nil, paramNode.WithSourceErrorf(paramName, "invalid parameter name: %w", err)
+		}
+
+		if _, ok := parameters[paramName]; ok {
+			return nil, paramNode.WithSourceErrorf(paramName, "duplicate parameter `%s` defined on caveat `%s`", paramName, definitionName)
+		}
+
+		typeRefNode, err := paramNode.Lookup(dslshape.NodeCaveatParameterPredicateType)
+		if err != nil {
+			return nil, paramNode.WithSourceErrorf(paramName, "invalid type for parameter: %w", err)
+		}
+
+		translatedType, err := translateCaveatTypeReference(tctx, typeRefNode)
+		if err != nil {
+			return nil, paramNode.WithSourceErrorf(paramName, "invalid type for caveat parameter `%s` on caveat `%s`: %w", paramName, definitionName, err)
+		}
+
+		parameters[paramName] = *translatedType
+		err = env.AddVariable(paramName, *translatedType)
+		if err != nil {
+			return nil, paramNode.WithSourceErrorf(paramName, "invalid type for caveat parameter `%s` on caveat `%s`: %w", paramName, definitionName, err)
+		}
+	}
+
+	caveatPath, err := tctx.prefixedPath(definitionName)
+	if err != nil {
+		return nil, defNode.Errorf("%w", err)
+	}
+
+	// caveat expression.
+	expressionStringNode, err := defNode.Lookup(dslshape.NodeCaveatDefinitionPredicateExpession)
+	if err != nil {
+		return nil, defNode.WithSourceErrorf(definitionName, "invalid expression: %w", err)
+	}
+
+	expressionString, err := expressionStringNode.GetString(dslshape.NodeCaveatExpressionPredicateExpression)
+	if err != nil {
+		return nil, defNode.WithSourceErrorf(expressionString, "invalid expression: %w", err)
+	}
+
+	rnge, err := expressionStringNode.Range(tctx.mapper)
+	if err != nil {
+		return nil, defNode.WithSourceErrorf(expressionString, "invalid expression: %w", err)
+	}
+
+	source, err := caveats.NewSource(expressionString, caveatPath)
+	if err != nil {
+		return nil, defNode.WithSourceErrorf(expressionString, "invalid expression: %w", err)
+	}
+
+	compiled, err := caveats.CompileCaveatWithSource(env, caveatPath, source, rnge.Start())
+	if err != nil {
+		return nil, expressionStringNode.WithSourceErrorf(expressionString, "invalid expression for caveat `%s`: %w", definitionName, err)
+	}
+
+	def, err := namespace.CompiledCaveatDefinition(env, caveatPath, compiled)
+	if err != nil {
+		return nil, err
+	}
+
+	def.Metadata = addComments(def.Metadata, defNode)
+	def.SourcePosition = getSourcePosition(defNode, tctx.mapper)
+	return def, nil
+}
+
+func translateCaveatTypeReference(tctx translationContext, typeRefNode *dslNode) (*caveattypes.VariableType, error) {
+	typeName, err := typeRefNode.GetString(dslshape.NodeCaveatTypeReferencePredicateType)
+	if err != nil {
+		return nil, typeRefNode.WithSourceErrorf(typeName, "invalid type name: %w", err)
+	}
+
+	childTypeNodes := typeRefNode.List(dslshape.NodeCaveatTypeReferencePredicateChildTypes)
+	childTypes := make([]caveattypes.VariableType, 0, len(childTypeNodes))
+	for _, childTypeNode := range childTypeNodes {
+		translated, err := translateCaveatTypeReference(tctx, childTypeNode)
+		if err != nil {
+			return nil, err
+		}
+		childTypes = append(childTypes, *translated)
+	}
+
+	constructedType, err := caveattypes.BuildType(typeName, childTypes)
+	if err != nil {
+		return nil, typeRefNode.WithSourceErrorf(typeName, "%w", err)
+	}
+
+	return constructedType, nil
+}
+
+func translateObjectDefinition(tctx translationContext, defNode *dslNode) (*core.NamespaceDefinition, error) {
 	definitionName, err := defNode.GetString(dslshape.NodeDefinitionPredicateName)
 	if err != nil {
-		return nil, defNode.Errorf("invalid definition name: %w", err)
+		return nil, defNode.WithSourceErrorf(definitionName, "invalid definition name: %w", err)
 	}
 
 	relationsAndPermissions := []*core.Relation{}
@@ -72,7 +221,7 @@ func translateDefinition(tctx translationContext, defNode *dslNode) (*core.Names
 		relationsAndPermissions = append(relationsAndPermissions, relationOrPermission)
 	}
 
-	nspath, err := tctx.namespacePath(definitionName)
+	nspath, err := tctx.prefixedPath(definitionName)
 	if err != nil {
 		return nil, defNode.Errorf("%w", err)
 	}
@@ -80,10 +229,12 @@ func translateDefinition(tctx translationContext, defNode *dslNode) (*core.Names
 	if len(relationsAndPermissions) == 0 {
 		ns := namespace.Namespace(nspath)
 		ns.Metadata = addComments(ns.Metadata, defNode)
+		ns.SourcePosition = getSourcePosition(defNode, tctx.mapper)
 
-		err = ns.Validate()
-		if err != nil {
-			return nil, defNode.Errorf("error in object definition %s: %w", nspath, err)
+		if !tctx.skipValidate {
+			if err = ns.Validate(); err != nil {
+				return nil, defNode.Errorf("error in object definition %s: %w", nspath, err)
+			}
 		}
 
 		return ns, nil
@@ -93,9 +244,10 @@ func translateDefinition(tctx translationContext, defNode *dslNode) (*core.Names
 	ns.Metadata = addComments(ns.Metadata, defNode)
 	ns.SourcePosition = getSourcePosition(defNode, tctx.mapper)
 
-	err = ns.Validate()
-	if err != nil {
-		return nil, defNode.Errorf("error in object definition %s: %w", nspath, err)
+	if !tctx.skipValidate {
+		if err := ns.Validate(); err != nil {
+			return nil, defNode.Errorf("error in object definition %s: %w", nspath, err)
+		}
 	}
 
 	return ns, nil
@@ -116,9 +268,13 @@ func getSourcePosition(dslNode *dslNode, mapper input.PositionMapper) *core.Sour
 		return nil
 	}
 
+	// We're okay with these being zero if the cast fails.
+	uintLine, _ := safecast.ToUint64(line)
+	uintCol, _ := safecast.ToUint64(col)
+
 	return &core.SourcePosition{
-		ZeroIndexedLineNumber:     uint64(line),
-		ZeroIndexedColumnPosition: uint64(col),
+		ZeroIndexedLineNumber:     uintLine,
+		ZeroIndexedColumnPosition: uintCol,
 	}
 }
 
@@ -185,10 +341,15 @@ func translateRelation(tctx translationContext, relationNode *dslNode) (*core.Re
 		allowedDirectTypes = append(allowedDirectTypes, allowedRelations...)
 	}
 
-	relation := namespace.Relation(relationName, nil, allowedDirectTypes...)
-	err = relation.Validate()
+	relation, err := namespace.Relation(relationName, nil, allowedDirectTypes...)
 	if err != nil {
-		return nil, relationNode.Errorf("error in relation %s: %w", relationName, err)
+		return nil, err
+	}
+
+	if !tctx.skipValidate {
+		if err := relation.Validate(); err != nil {
+			return nil, relationNode.Errorf("error in relation %s: %w", relationName, err)
+		}
 	}
 
 	return relation, nil
@@ -210,10 +371,15 @@ func translatePermission(tctx translationContext, permissionNode *dslNode) (*cor
 		return nil, err
 	}
 
-	permission := namespace.Relation(permissionName, rewrite)
-	err = permission.Validate()
+	permission, err := namespace.Relation(permissionName, rewrite)
 	if err != nil {
-		return nil, permissionNode.Errorf("error in permission %s: %w", permissionName, err)
+		return nil, err
+	}
+
+	if !tctx.skipValidate {
+		if err := permission.Validate(); err != nil {
+			return nil, permissionNode.Errorf("error in permission %s: %w", permissionName, err)
+		}
 	}
 
 	return permission, nil
@@ -253,23 +419,54 @@ func translateExpression(tctx translationContext, expressionNode *dslNode) (*cor
 	return translated, nil
 }
 
+func collapseOps(op *core.SetOperation_Child, handler func(rewrite *core.UsersetRewrite) *core.SetOperation) []*core.SetOperation_Child {
+	if op.GetUsersetRewrite() == nil {
+		return []*core.SetOperation_Child{op}
+	}
+
+	usersetRewrite := op.GetUsersetRewrite()
+	operation := handler(usersetRewrite)
+	if operation == nil {
+		return []*core.SetOperation_Child{op}
+	}
+
+	collapsed := make([]*core.SetOperation_Child, 0, len(operation.Child))
+	for _, child := range operation.Child {
+		collapsed = append(collapsed, collapseOps(child, handler)...)
+	}
+	return collapsed
+}
+
 func translateExpressionDirect(tctx translationContext, expressionNode *dslNode) (*core.UsersetRewrite, error) {
+	// For union and intersection, we collapse a tree of binary operations into a flat list containing child
+	// operations of the *same* type.
+	translate := func(
+		builder func(firstChild *core.SetOperation_Child, rest ...*core.SetOperation_Child) *core.UsersetRewrite,
+		lookup func(rewrite *core.UsersetRewrite) *core.SetOperation,
+	) (*core.UsersetRewrite, error) {
+		leftOperation, rightOperation, err := translateBinary(tctx, expressionNode)
+		if err != nil {
+			return nil, err
+		}
+		leftOps := collapseOps(leftOperation, lookup)
+		rightOps := collapseOps(rightOperation, lookup)
+		ops := append(leftOps, rightOps...)
+		return builder(ops[0], ops[1:]...), nil
+	}
+
 	switch expressionNode.GetType() {
 	case dslshape.NodeTypeUnionExpression:
-		leftOperation, rightOperation, err := translateBinary(tctx, expressionNode)
-		if err != nil {
-			return nil, err
-		}
-		return namespace.Union(leftOperation, rightOperation), nil
+		return translate(namespace.Union, func(rewrite *core.UsersetRewrite) *core.SetOperation {
+			return rewrite.GetUnion()
+		})
 
 	case dslshape.NodeTypeIntersectExpression:
-		leftOperation, rightOperation, err := translateBinary(tctx, expressionNode)
-		if err != nil {
-			return nil, err
-		}
-		return namespace.Intersection(leftOperation, rightOperation), nil
+		return translate(namespace.Intersection, func(rewrite *core.UsersetRewrite) *core.SetOperation {
+			return rewrite.GetIntersection()
+		})
 
 	case dslshape.NodeTypeExclusionExpression:
+		// Order matters for exclusions, so do not perform the optimization.
 		leftOperation, rightOperation, err := translateBinary(tctx, expressionNode)
 		if err != nil {
 			return nil, err
@@ -334,6 +531,15 @@ func translateExpressionOperationDirect(tctx translationContext, expressionOpNod
 			return nil, err
 		}
 
+		if expressionOpNode.Has(dslshape.NodeArrowExpressionFunctionName) {
+			functionName, err := expressionOpNode.GetString(dslshape.NodeArrowExpressionFunctionName)
+			if err != nil {
+				return nil, err
+			}
+
+			return namespace.MustFunctionedTupleToUserset(tuplesetRelation, functionName, usersetRelation), nil
+		}
+
 		return namespace.TupleToUserset(tuplesetRelation, usersetRelation), nil
 
 	case dslshape.NodeTypeUnionExpression:
@@ -386,7 +592,7 @@ func translateSpecificTypeReference(tctx translationContext, typeRefNode *dslNod
 		return nil, typeRefNode.Errorf("invalid type name: %w", err)
 	}
 
-	nspath, err := tctx.namespacePath(typePath)
+	nspath, err := tctx.prefixedPath(typePath)
 	if err != nil {
 		return nil, typeRefNode.Errorf("%w", err)
 	}
@@ -399,9 +605,15 @@ func translateSpecificTypeReference(tctx translationContext, typeRefNode *dslNod
 			},
 		}
 
-		err = ref.Validate()
+		err = addWithCaveats(tctx, typeRefNode, ref)
 		if err != nil {
-			return nil, typeRefNode.Errorf("invalid type relation: %w", err)
+			return nil, typeRefNode.Errorf("invalid caveat: %w", err)
+		}
+
+		if !tctx.skipValidate {
+			if err := ref.Validate(); err != nil {
+				return nil, typeRefNode.Errorf("invalid type relation: %w", err)
+			}
 		}
 
 		ref.SourcePosition = getSourcePosition(typeRefNode, tctx.mapper)
@@ -423,11 +635,62 @@ func translateSpecificTypeReference(tctx translationContext, typeRefNode *dslNod
 		},
 	}
 
-	err = ref.Validate()
+	// Add the caveat(s), if any.
+	err = addWithCaveats(tctx, typeRefNode, ref)
 	if err != nil {
-		return nil, typeRefNode.Errorf("invalid type relation: %w", err)
+		return nil, typeRefNode.Errorf("invalid caveat: %w", err)
+	}
+
+	// Add the expiration trait, if any.
+	if traitNode, err := typeRefNode.Lookup(dslshape.NodeSpecificReferencePredicateTrait); err == nil {
+		traitName, err := traitNode.GetString(dslshape.NodeTraitPredicateTrait)
+		if err != nil {
+			return nil, typeRefNode.Errorf("invalid trait: %w", err)
+		}
+
+		if traitName != "expiration" {
+			return nil, typeRefNode.Errorf("invalid trait: %s", traitName)
+		}
+
+		if !slices.Contains(tctx.allowedFlags, "expiration") {
+			return nil, typeRefNode.Errorf("expiration trait is not allowed")
+		}
+
+		ref.RequiredExpiration = &core.ExpirationTrait{}
+	}
+
+	if !tctx.skipValidate {
+		if err := ref.Validate(); err != nil {
+			return nil, typeRefNode.Errorf("invalid type relation: %w", err)
+		}
 	}
 
 	ref.SourcePosition = getSourcePosition(typeRefNode, tctx.mapper)
 	return ref, nil
+}
+
+func addWithCaveats(tctx translationContext, typeRefNode *dslNode, ref *core.AllowedRelation) error {
+	caveats := typeRefNode.List(dslshape.NodeSpecificReferencePredicateCaveat)
+	if len(caveats) == 0 {
+		return nil
+	}
+
+	if len(caveats) != 1 {
+		return fmt.Errorf("only one caveat is currently allowed per type reference")
+	}
+
+	name, err := caveats[0].GetString(dslshape.NodeCaveatPredicateCaveat)
+	if err != nil {
+		return err
+	}
+
+	nspath, err := tctx.prefixedPath(name)
+	if err != nil {
+		return err
+	}
+
+	ref.RequiredCaveat = &core.AllowedCaveat{
+		CaveatName: nspath,
+	}
+	return nil
 }

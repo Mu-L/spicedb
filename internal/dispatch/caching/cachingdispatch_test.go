@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	"github.com/authzed/spicedb/internal/dispatch"
+	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
 	"github.com/authzed/spicedb/pkg/tuple"
 )
@@ -20,6 +22,13 @@ type checkRequest struct {
 	depthRequired     uint32
 	depthRemaining    uint32
 	expectPassthrough bool
+}
+
+func RR(namespaceName string, relationName string) *core.RelationReference {
+	return &core.RelationReference{
+		Namespace: namespaceName,
+		Relation:  relationName,
+	}
 }
 
 func TestMaxDepthCaching(t *testing.T) {
@@ -77,6 +86,7 @@ func TestMaxDepthCaching(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			require := require.New(t)
 
@@ -84,15 +94,23 @@ func TestMaxDepthCaching(t *testing.T) {
 
 			for _, step := range tc.script {
 				if step.expectPassthrough {
+					parsed, err := tuple.ParseONR(step.start)
+					require.NoError(err)
+
 					delegate.On("DispatchCheck", &v1.DispatchCheckRequest{
-						ObjectAndRelation: tuple.ParseONR(step.start),
-						Subject:           tuple.ParseSubjectONR(step.goal),
+						ResourceRelation: RR(parsed.ObjectType, parsed.Relation),
+						ResourceIds:      []string{parsed.ObjectID},
+						Subject:          tuple.MustParseSubjectONR(step.goal).ToCoreONR(),
 						Metadata: &v1.ResolverMeta{
 							AtRevision:     step.atRevision.String(),
 							DepthRemaining: step.depthRemaining,
 						},
 					}).Return(&v1.DispatchCheckResponse{
-						Membership: v1.DispatchCheckResponse_MEMBER,
+						ResultsByResourceId: map[string]*v1.ResourceCheckResult{
+							parsed.ObjectID: {
+								Membership: v1.ResourceCheckResult_MEMBER,
+							},
+						},
 						Metadata: &v1.ResponseMeta{
 							DispatchCount: 1,
 							DepthRequired: step.depthRequired,
@@ -101,25 +119,28 @@ func TestMaxDepthCaching(t *testing.T) {
 				}
 			}
 
-			dispatch, err := NewCachingDispatcher(nil, "")
+			dispatch, err := NewCachingDispatcher(DispatchTestCache(t), false, "", nil)
 			dispatch.SetDelegate(delegate)
 			require.NoError(err)
 			defer dispatch.Close()
 
 			for _, step := range tc.script {
+				parsed, err := tuple.ParseONR(step.start)
+				require.NoError(err)
+
 				resp, err := dispatch.DispatchCheck(context.Background(), &v1.DispatchCheckRequest{
-					ObjectAndRelation: tuple.ParseONR(step.start),
-					Subject:           tuple.ParseSubjectONR(step.goal),
+					ResourceRelation: RR(parsed.ObjectType, parsed.Relation),
+					ResourceIds:      []string{parsed.ObjectID},
+					Subject:          tuple.MustParseSubjectONR(step.goal).ToCoreONR(),
 					Metadata: &v1.ResolverMeta{
 						AtRevision:     step.atRevision.String(),
 						DepthRemaining: step.depthRemaining,
 					},
 				})
 				require.NoError(err)
-				require.Equal(v1.DispatchCheckResponse_MEMBER, resp.Membership)
+				require.Equal(v1.ResourceCheckResult_MEMBER, resp.ResultsByResourceId[parsed.ObjectID].Membership)
 
-				// We have to sleep a while to let the cache converge:
-				// https://github.com/dgraph-io/ristretto/blob/01b9f37dd0fd453225e042d6f3a27cd14f252cd0/cache_test.go#L17
+				// We have to sleep a while to let the cache converge
 				time.Sleep(10 * time.Millisecond)
 			}
 
@@ -132,19 +153,29 @@ type delegateDispatchMock struct {
 	*mock.Mock
 }
 
-func (ddm delegateDispatchMock) DispatchCheck(ctx context.Context, req *v1.DispatchCheckRequest) (*v1.DispatchCheckResponse, error) {
+func (ddm delegateDispatchMock) DispatchCheck(_ context.Context, req *v1.DispatchCheckRequest) (*v1.DispatchCheckResponse, error) {
 	args := ddm.Called(req)
 	return args.Get(0).(*v1.DispatchCheckResponse), args.Error(1)
 }
 
-func (ddm delegateDispatchMock) DispatchExpand(ctx context.Context, req *v1.DispatchExpandRequest) (*v1.DispatchExpandResponse, error) {
+func (ddm delegateDispatchMock) DispatchExpand(_ context.Context, _ *v1.DispatchExpandRequest) (*v1.DispatchExpandResponse, error) {
 	return &v1.DispatchExpandResponse{}, nil
 }
 
-func (ddm delegateDispatchMock) DispatchLookup(ctx context.Context, req *v1.DispatchLookupRequest) (*v1.DispatchLookupResponse, error) {
-	return &v1.DispatchLookupResponse{}, nil
+func (ddm delegateDispatchMock) DispatchLookupResources2(_ *v1.DispatchLookupResources2Request, _ dispatch.LookupResources2Stream) error {
+	return nil
+}
+
+func (ddm delegateDispatchMock) DispatchLookupSubjects(_ *v1.DispatchLookupSubjectsRequest, _ dispatch.LookupSubjectsStream) error {
+	return nil
 }
 
 func (ddm delegateDispatchMock) Close() error {
 	return nil
 }
+
+func (ddm delegateDispatchMock) ReadyState() dispatch.ReadyState {
+	return dispatch.ReadyState{IsReady: true}
+}
+
+var _ dispatch.Dispatcher = &delegateDispatchMock{}

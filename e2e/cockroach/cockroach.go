@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/authzed/spicedb/e2e"
 )
@@ -23,6 +23,7 @@ type Node struct {
 	Httpaddr  string
 	ID        string
 	MaxOffset time.Duration
+	Cancel    context.CancelFunc
 	// only available after Start()
 	pid  int
 	conn *pgx.Conn
@@ -37,7 +38,7 @@ func (c *Node) Start(ctx context.Context) error {
 	cmd := []string{
 		"./cockroach",
 		"start",
-		"--store=node" + c.ID,
+		"--store=type=mem,size=640MiB",
 		"--logtostderr",
 		"--insecure",
 		"--listen-addr=" + c.Addr,
@@ -46,8 +47,18 @@ func (c *Node) Start(ctx context.Context) error {
 		"--max-offset=" + c.MaxOffset.String(),
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	c.Cancel = cancel
 	c.pid, err = e2e.GoRun(ctx, logfile, logfile, cmd...)
 	return err
+}
+
+func (c *Node) Stop() error {
+	if c.pid < 1 {
+		return fmt.Errorf("can't stop an unstarted crdb")
+	}
+	c.Cancel()
+	return nil
 }
 
 // ConnectionString returns the postgres db URI for this cluster
@@ -56,7 +67,7 @@ func (c *Node) ConnectionString(dbName string) string {
 }
 
 // Connect connects directly to the cockroach instance and caches the connection
-func (c *Node) Connect(ctx context.Context, out io.Writer, dbName string) error {
+func (c *Node) Connect(ctx context.Context, _ io.Writer, dbName string) error {
 	if c.pid < 1 {
 		return fmt.Errorf("can't connect to unstarted cockroach")
 	}
@@ -79,19 +90,11 @@ func (c *Node) Conn() *pgx.Conn {
 // the value that is referenced by other crdb metadata to identify range leader,
 // follower nodes, etc.
 func (c *Node) NodeID(ctx context.Context) (int, error) {
-	rows, err := c.conn.Query(ctx, "SHOW node_id")
-	defer rows.Close()
-	if err != nil {
+	var nodeID string
+	if err := c.conn.QueryRow(ctx, "SHOW node_id").Scan(&nodeID); err != nil {
 		return -1, err
 	}
-	// despite being an int, crdb returns node id as a string
-	var nodeID string
-	for rows.Next() {
-		if err := rows.Scan(&nodeID); err != nil {
-			return -1, err
-		}
-		break
-	}
+
 	i, err := strconv.Atoi(nodeID)
 	if err != nil {
 		return -1, err
@@ -136,14 +139,27 @@ func (cs Cluster) Started() bool {
 	return true
 }
 
+// Stop stops the entire cluster of spicedb instances
+func (cs Cluster) Stop(out io.Writer) error {
+	for i, c := range cs {
+		fmt.Fprintln(out, "stopping crdb node", i)
+		if err := c.Stop(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Init runs the cockroach init command against the cluster
 func (cs Cluster) Init(ctx context.Context, out, errOut io.Writer) {
 	// this retries until it succeeds, it won't return unless it does
-	e2e.Run(ctx, out, errOut, "./cockroach",
+	if err := e2e.Run(ctx, out, errOut, "./cockroach",
 		"init",
 		"--insecure",
 		"--host="+cs[0].Addr,
-	)
+	); err != nil {
+		panic(err)
+	}
 }
 
 // SQL runs the set of SQL commands against the cluster

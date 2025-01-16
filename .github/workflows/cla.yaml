@@ -9,9 +9,15 @@ on:  # yamllint disable-line rule:truthy
       - "opened"
       - "closed"
       - "synchronize"
+  merge_group:
+    types:
+      - "checks_requested"
 jobs:
   cla:
     name: "Check Signature"
-    runs-on: "ubuntu-latest"
+    runs-on: "buildjet-2vcpu-ubuntu-2204"
     steps:
       - uses: "authzed/actions/cla-check@main"
+        with:
+          github_token: "${{ secrets.GITHUB_TOKEN }}"
+          cla_assistant_token: "${{ secrets.CLA_ASSISTANT_ACCESS_TOKEN }}"

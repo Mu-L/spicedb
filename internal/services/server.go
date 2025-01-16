@@ -1,23 +1,27 @@
 package services
 
 import (
-	v0 "github.com/authzed/authzed-go/proto/authzed/api/v0"
+	"time"
+
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
-	"github.com/authzed/authzed-go/proto/authzed/api/v1alpha1"
 	"github.com/authzed/grpcutil"
 	"google.golang.org/grpc"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
 	"github.com/authzed/spicedb/internal/dispatch"
-	"github.com/authzed/spicedb/internal/namespace"
-	v0svc "github.com/authzed/spicedb/internal/services/v0"
+	"github.com/authzed/spicedb/internal/services/health"
 	v1svc "github.com/authzed/spicedb/internal/services/v1"
-	v1alpha1svc "github.com/authzed/spicedb/internal/services/v1alpha1"
 )
 
-// SchemaServiceOption defines the options for enabled or disabled the V1 Schema service.
+// SchemaServiceOption defines the options for enabling or disabling the V1 Schema service.
 type SchemaServiceOption int
+
+// WatchServiceOption defines the options for enabling or disabling the V1 Watch service.
+type WatchServiceOption int
+
+// CaveatsOption defines the options for enabling or disabling caveats in the V1 services.
+type CaveatsOption int
 
 const (
 	// V1SchemaServiceDisabled indicates that the V1 schema service is disabled.
@@ -25,43 +29,49 @@ const (
 
 	// V1SchemaServiceEnabled indicates that the V1 schema service is enabled.
 	V1SchemaServiceEnabled SchemaServiceOption = 1
+
+	// V1SchemaServiceAdditiveOnly indicates that the V1 schema service is enabled in additive-only
+	// mode for testing.
+	V1SchemaServiceAdditiveOnly SchemaServiceOption = 2
+
+	// WatchServiceDisabled indicates that the V1 watch service is disabled.
+	WatchServiceDisabled WatchServiceOption = 0
+
+	// WatchServiceEnabled indicates that the V1 watch service is enabled.
+	WatchServiceEnabled WatchServiceOption = 1
+)
+
+const (
+	// OverallServerHealthCheckKey is used for grpc health check requests for the overall system.
+	OverallServerHealthCheckKey = ""
 )
 
 // RegisterGrpcServices registers all services to be exposed on the GRPC server.
 func RegisterGrpcServices(
 	srv *grpc.Server,
-	nsm namespace.Manager,
+	healthManager health.Manager,
 	dispatch dispatch.Dispatcher,
-	maxDepth uint32,
-	prefixRequired v1alpha1svc.PrefixRequiredOption,
 	schemaServiceOption SchemaServiceOption,
+	watchServiceOption WatchServiceOption,
+	permSysConfig v1svc.PermissionsServerConfig,
+	watchHeartbeatDuration time.Duration,
 ) {
-	healthSrv := grpcutil.NewAuthlessHealthServer()
+	healthManager.RegisterReportedService(OverallServerHealthCheckKey)
 
-	v0.RegisterACLServiceServer(srv, v0svc.NewACLServer(nsm, dispatch, maxDepth))
-	healthSrv.SetServicesHealthy(&v0.ACLService_ServiceDesc)
+	v1.RegisterPermissionsServiceServer(srv, v1svc.NewPermissionsServer(dispatch, permSysConfig))
+	v1.RegisterExperimentalServiceServer(srv, v1svc.NewExperimentalServer(dispatch, permSysConfig))
+	healthManager.RegisterReportedService(v1.PermissionsService_ServiceDesc.ServiceName)
 
-	v0.RegisterNamespaceServiceServer(srv, v0svc.NewNamespaceServer())
-	healthSrv.SetServicesHealthy(&v0.NamespaceService_ServiceDesc)
-
-	v0.RegisterWatchServiceServer(srv, v0svc.NewWatchServer(nsm))
-	healthSrv.SetServicesHealthy(&v0.WatchService_ServiceDesc)
-
-	v1alpha1.RegisterSchemaServiceServer(srv, v1alpha1svc.NewSchemaServer(prefixRequired))
-	healthSrv.SetServicesHealthy(&v1alpha1.SchemaService_ServiceDesc)
-
-	v1.RegisterPermissionsServiceServer(srv, v1svc.NewPermissionsServer(nsm, dispatch, maxDepth))
-	healthSrv.SetServicesHealthy(&v1.PermissionsService_ServiceDesc)
-
-	v1.RegisterWatchServiceServer(srv, v1svc.NewWatchServer())
-	healthSrv.SetServicesHealthy(&v1.WatchService_ServiceDesc)
-
-	if schemaServiceOption == V1SchemaServiceEnabled {
-		v1.RegisterSchemaServiceServer(srv, v1svc.NewSchemaServer())
-		healthSrv.SetServicesHealthy(&v1.SchemaService_ServiceDesc)
+	if watchServiceOption == WatchServiceEnabled {
+		v1.RegisterWatchServiceServer(srv, v1svc.NewWatchServer(watchHeartbeatDuration))
+		healthManager.RegisterReportedService(v1.WatchService_ServiceDesc.ServiceName)
 	}
 
-	healthpb.RegisterHealthServer(srv, healthSrv)
+	if schemaServiceOption == V1SchemaServiceEnabled || schemaServiceOption == V1SchemaServiceAdditiveOnly {
+		v1.RegisterSchemaServiceServer(srv, v1svc.NewSchemaServer(schemaServiceOption == V1SchemaServiceAdditiveOnly, permSysConfig.ExpiringRelationshipsEnabled))
+		healthManager.RegisterReportedService(v1.SchemaService_ServiceDesc.ServiceName)
+	}
 
+	healthpb.RegisterHealthServer(srv, healthManager.HealthSvc())
 	reflection.Register(grpcutil.NewAuthlessReflectionInterceptor(srv))
 }

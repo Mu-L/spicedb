@@ -5,15 +5,15 @@ import (
 	"fmt"
 	"os"
 
+	log "github.com/authzed/spicedb/internal/logging"
+	dsctx "github.com/authzed/spicedb/internal/middleware/datastore"
+	"github.com/authzed/spicedb/internal/namespace"
+	"github.com/authzed/spicedb/internal/relationships"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/genutil/slicez"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
-
-	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
-	"github.com/rs/zerolog/log"
-	"github.com/shopspring/decimal"
-	"google.golang.org/protobuf/encoding/prototext"
-
-	"github.com/authzed/spicedb/internal/datastore"
 	"github.com/authzed/spicedb/pkg/tuple"
+	"github.com/authzed/spicedb/pkg/typesystem"
 )
 
 // PopulatedValidationFile contains the fully parsed information from a validation file.
@@ -25,9 +25,13 @@ type PopulatedValidationFile struct {
 	// direct or compiled from schema form.
 	NamespaceDefinitions []*core.NamespaceDefinition
 
-	// Tuples are the relation tuples defined in the validation file, either directly
+	// CaveatDefinitions are the caveats defined in the validation file, in either
+	// direct or compiled from schema form.
+	CaveatDefinitions []*core.CaveatDefinition
+
+	// Relationships are the relationships defined in the validation file, either directly
 	// or in the relationships block.
-	Tuples []*core.RelationTuple
+	Relationships []tuple.Relationship
 
 	// ParsedFiles are the underlying parsed validation files.
 	ParsedFiles []ValidationFile
@@ -35,99 +39,137 @@ type PopulatedValidationFile struct {
 
 // PopulateFromFiles populates the given datastore with the namespaces and tuples found in
 // the validation file(s) specified.
-func PopulateFromFiles(ds datastore.Datastore, filePaths []string) (*PopulatedValidationFile, decimal.Decimal, error) {
-	var revision decimal.Decimal
-	nsDefs := []*core.NamespaceDefinition{}
-	schema := ""
-	tuples := []*core.RelationTuple{}
-	files := []ValidationFile{}
+func PopulateFromFiles(ctx context.Context, ds datastore.Datastore, filePaths []string) (*PopulatedValidationFile, datastore.Revision, error) {
+	contents := map[string][]byte{}
 
 	for _, filePath := range filePaths {
 		fileContents, err := os.ReadFile(filePath)
 		if err != nil {
-			return nil, decimal.Zero, err
+			return nil, datastore.NoRevision, err
 		}
 
+		contents[filePath] = fileContents
+	}
+
+	return PopulateFromFilesContents(ctx, ds, contents)
+}
+
+// PopulateFromFilesContents populates the given datastore with the namespaces and tuples found in
+// the validation file(s) contents specified.
+func PopulateFromFilesContents(ctx context.Context, ds datastore.Datastore, filesContents map[string][]byte) (*PopulatedValidationFile, datastore.Revision, error) {
+	var schema string
+	var objectDefs []*core.NamespaceDefinition
+	var caveatDefs []*core.CaveatDefinition
+	var rels []tuple.Relationship
+	var updates []tuple.RelationshipUpdate
+
+	var revision datastore.Revision
+
+	files := make([]ValidationFile, 0, len(filesContents))
+
+	// Parse each file into definitions and relationship updates.
+	for filePath, fileContents := range filesContents {
+		// Decode the validation file.
 		parsed, err := DecodeValidationFile(fileContents)
 		if err != nil {
-			return nil, decimal.Zero, fmt.Errorf("error when parsing config file %s: %w", filePath, err)
+			return nil, datastore.NoRevision, fmt.Errorf("error when parsing config file %s: %w", filePath, err)
 		}
 
 		files = append(files, *parsed)
 
-		// Add schema-based namespace definitions.
-		defs := parsed.Schema.Definitions
-		if len(defs) > 0 {
-			schema += parsed.Schema.Schema + "\n\n"
+		// Disallow legacy sections.
+		if len(parsed.NamespaceConfigs) > 0 {
+			return nil, revision, fmt.Errorf("definitions must be specified in `schema`")
 		}
 
-		log.Info().Str("filePath", filePath).Int("schemaDefinitionCount", len(defs)).Msg("Loading schema definitions")
-		for index, nsDef := range defs {
-			nsDefs = append(nsDefs, nsDef)
-			log.Info().Str("filePath", filePath).Str("namespaceName", nsDef.Name).Msg("Loading namespace")
-			_, lnerr := ds.WriteNamespace(context.Background(), nsDef)
-			if lnerr != nil {
-				return nil, decimal.Zero, fmt.Errorf("error when loading namespace config #%v from file %s: %w", index, filePath, lnerr)
-			}
+		if len(parsed.ValidationTuples) > 0 {
+			return nil, revision, fmt.Errorf("relationships must be specified in `relationships`")
 		}
 
-		// Load the namespace configs.
-		log.Info().Str("filePath", filePath).Int("namespaceCount", len(parsed.NamespaceConfigs)).Msg("Loading namespaces")
-		for index, namespaceConfig := range parsed.NamespaceConfigs {
-			nsDef := core.NamespaceDefinition{}
-			nerr := prototext.Unmarshal([]byte(namespaceConfig), &nsDef)
-			if nerr != nil {
-				return nil, decimal.Zero, fmt.Errorf("error when parsing namespace config #%v from file %s: %w", index, filePath, nerr)
+		// Add schema definitions.
+		if parsed.Schema.CompiledSchema != nil {
+			defs := parsed.Schema.CompiledSchema.ObjectDefinitions
+			if len(defs) > 0 {
+				schema += parsed.Schema.Schema + "\n\n"
 			}
-			nsDefs = append(nsDefs, &nsDef)
 
-			log.Info().Str("filePath", filePath).Str("namespaceName", nsDef.Name).Msg("Loading namespace")
-			_, lnerr := ds.WriteNamespace(context.Background(), &nsDef)
-			if lnerr != nil {
-				return nil, decimal.Zero, fmt.Errorf("error when loading namespace config #%v from file %s: %w", index, filePath, lnerr)
-			}
+			log.Ctx(ctx).Info().Str("filePath", filePath).
+				Int("definitionCount", len(defs)).
+				Int("caveatDefinitionCount", len(parsed.Schema.CompiledSchema.CaveatDefinitions)).
+				Int("schemaDefinitionCount", len(parsed.Schema.CompiledSchema.OrderedDefinitions)).
+				Msg("adding schema definitions")
+
+			objectDefs = append(objectDefs, defs...)
+			caveatDefs = append(caveatDefs, parsed.Schema.CompiledSchema.CaveatDefinitions...)
 		}
 
-		// Load the validation tuples/relationships.
-		var updates []*v1.RelationshipUpdate
-		seenTuples := map[string]bool{}
+		// Parse relationships for updates.
 		for _, rel := range parsed.Relationships.Relationships {
-			updates = append(updates, &v1.RelationshipUpdate{
-				Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-				Relationship: rel,
-			})
-			tpl := tuple.MustFromRelationship(rel)
-			tuples = append(tuples, tpl)
-			seenTuples[tuple.String(tpl)] = true
+			updates = append(updates, tuple.Touch(rel))
+			rels = append(rels, rel)
 		}
-
-		log.Info().Str("filePath", filePath).Int("tupleCount", len(updates)+len(parsed.ValidationTuples)).Msg("Loading test data")
-		for index, validationTuple := range parsed.ValidationTuples {
-			tpl := tuple.Parse(validationTuple)
-			if tpl == nil {
-				return nil, decimal.Zero, fmt.Errorf("error parsing validation tuple #%v: %s", index, validationTuple)
-			}
-
-			_, ok := seenTuples[tuple.String(tpl)]
-			if ok {
-				continue
-			}
-			seenTuples[tuple.String(tpl)] = true
-
-			tuples = append(tuples, tpl)
-			updates = append(updates, &v1.RelationshipUpdate{
-				Operation:    v1.RelationshipUpdate_OPERATION_CREATE,
-				Relationship: tuple.MustToRelationship(tpl),
-			})
-		}
-
-		wrevision, terr := ds.WriteTuples(context.Background(), nil, updates)
-		if terr != nil {
-			return nil, decimal.Zero, fmt.Errorf("error when loading validation tuples from file %s: %w", filePath, terr)
-		}
-
-		revision = wrevision
 	}
 
-	return &PopulatedValidationFile{schema, nsDefs, tuples, files}, revision, nil
+	// Load the definitions and relationships into the datastore.
+	revision, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		// Write the caveat definitions.
+		err := rwt.WriteCaveats(ctx, caveatDefs)
+		if err != nil {
+			return err
+		}
+
+		// Validate and write the object definitions.
+		for _, objectDef := range objectDefs {
+			ts, err := typesystem.NewNamespaceTypeSystem(objectDef,
+				typesystem.ResolverForDatastoreReader(rwt).WithPredefinedElements(typesystem.PredefinedElements{
+					Namespaces: objectDefs,
+					Caveats:    caveatDefs,
+				}))
+			if err != nil {
+				return err
+			}
+
+			ctx := dsctx.ContextWithDatastore(ctx, ds)
+			vts, terr := ts.Validate(ctx)
+			if terr != nil {
+				return terr
+			}
+
+			aerr := namespace.AnnotateNamespace(vts)
+			if aerr != nil {
+				return aerr
+			}
+
+			if err := rwt.WriteNamespaces(ctx, objectDef); err != nil {
+				return fmt.Errorf("error when loading object definition %s: %w", objectDef.Name, err)
+			}
+		}
+
+		return err
+	})
+
+	slicez.ForEachChunk(updates, 500, func(chunked []tuple.RelationshipUpdate) {
+		if err != nil {
+			return
+		}
+
+		chunkedRels := make([]tuple.Relationship, 0, len(chunked))
+		for _, update := range chunked {
+			chunkedRels = append(chunkedRels, update.Relationship)
+		}
+		revision, err = ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+			err = relationships.ValidateRelationshipsForCreateOrTouch(ctx, rwt, chunkedRels...)
+			if err != nil {
+				return err
+			}
+
+			return rwt.WriteRelationships(ctx, chunked)
+		})
+	})
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &PopulatedValidationFile{schema, objectDefs, caveatDefs, rels, files}, revision, err
 }

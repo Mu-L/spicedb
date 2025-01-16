@@ -5,26 +5,34 @@ import (
 	dbsql "database/sql"
 	"errors"
 	"fmt"
-	"math/rand"
+	"os"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
+	"github.com/IBM/pgxpoolprometheus"
 	sq "github.com/Masterminds/squirrel"
-	"github.com/jackc/pgtype"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/log/zerologadapter"
-	"github.com/jackc/pgx/v4/pgxpool"
-	"github.com/jackc/pgx/v4/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/mattn/go-isatty"
 	"github.com/ngrok/sqlmw"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/rs/zerolog/log"
-	"github.com/shopspring/decimal"
+	"github.com/schollz/progressbar/v3"
 	"go.opentelemetry.io/otel"
+	"golang.org/x/sync/errgroup"
 
-	"github.com/authzed/spicedb/internal/datastore"
+	datastoreinternal "github.com/authzed/spicedb/internal/datastore"
 	"github.com/authzed/spicedb/internal/datastore/common"
+	pgxcommon "github.com/authzed/spicedb/internal/datastore/postgres/common"
 	"github.com/authzed/spicedb/internal/datastore/postgres/migrations"
+	"github.com/authzed/spicedb/internal/datastore/revisions"
+	log "github.com/authzed/spicedb/internal/logging"
+	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/datastore/options"
+	"github.com/authzed/spicedb/pkg/spiceerrors"
 )
 
 func init() {
@@ -32,60 +40,56 @@ func init() {
 }
 
 const (
-	Engine           = "postgres"
-	tableNamespace   = "namespace_config"
-	tableTransaction = "relation_tuple_transaction"
-	tableTuple       = "relation_tuple"
+	Engine                   = "postgres"
+	tableNamespace           = "namespace_config"
+	tableTransaction         = "relation_tuple_transaction"
+	tableTuple               = "relation_tuple"
+	tableCaveat              = "caveat"
+	tableRelationshipCounter = "relationship_counter"
 
-	colID               = "id"
-	colTimestamp        = "timestamp"
-	colNamespace        = "namespace"
-	colConfig           = "serialized_config"
-	colCreatedTxn       = "created_transaction"
-	colDeletedTxn       = "deleted_transaction"
-	colObjectID         = "object_id"
-	colRelation         = "relation"
-	colUsersetNamespace = "userset_namespace"
-	colUsersetObjectID  = "userset_object_id"
-	colUsersetRelation  = "userset_relation"
+	colXID               = "xid"
+	colTimestamp         = "timestamp"
+	colMetadata          = "metadata"
+	colNamespace         = "namespace"
+	colConfig            = "serialized_config"
+	colCreatedXid        = "created_xid"
+	colDeletedXid        = "deleted_xid"
+	colSnapshot          = "snapshot"
+	colObjectID          = "object_id"
+	colRelation          = "relation"
+	colUsersetNamespace  = "userset_namespace"
+	colUsersetObjectID   = "userset_object_id"
+	colUsersetRelation   = "userset_relation"
+	colCaveatName        = "name"
+	colCaveatDefinition  = "definition"
+	colCaveatContextName = "caveat_name"
+	colCaveatContext     = "caveat_context"
+	colExpiration        = "expiration"
 
-	errUnableToInstantiate = "unable to instantiate datastore: %w"
-	errRevision            = "unable to find revision: %w"
-	errCheckRevision       = "unable to check revision: %w"
+	colCounterName         = "name"
+	colCounterFilter       = "serialized_filter"
+	colCounterCurrentCount = "current_count"
+	colCounterSnapshot     = "updated_revision_snapshot"
 
-	createTxn = "INSERT INTO relation_tuple_transaction DEFAULT VALUES RETURNING id"
+	errUnableToInstantiate = "unable to instantiate datastore"
+
+	// The parameters to this format string are:
+	// 1: the created_xid or deleted_xid column name
+	//
+	// The placeholders are the snapshot and the expected boolean value respectively.
+	snapshotAlive = "pg_visible_in_snapshot(%[1]s, ?) = ?"
 
 	// This is the largest positive integer possible in postgresql
 	liveDeletedTxnID = uint64(9223372036854775807)
 
 	tracingDriverName = "postgres-tracing"
 
-	batchDeleteSize = 1000
+	gcBatchDeleteSize = 1000
+
+	primaryInstanceID = -1
 )
 
-var (
-	gcDurationHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "spicedb",
-		Subsystem: "datastore",
-		Name:      "postgres_gc_duration",
-		Help:      "postgres garbage collection duration distribution in seconds.",
-		Buckets:   []float64{0.01, 0.1, 0.5, 1, 5, 10, 25, 60, 120},
-	})
-
-	gcRelationshipsClearedGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: "spicedb",
-		Subsystem: "datastore",
-		Name:      "postgres_relationships_cleared",
-		Help:      "number of relationships cleared by postgres garbage collection.",
-	})
-
-	gcTransactionsClearedGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: "spicedb",
-		Subsystem: "datastore",
-		Name:      "postgres_transactions_cleared",
-		Help:      "number of transactions cleared by postgres garbage collection.",
-	})
-)
+var livingTupleConstraints = []string{"uq_relation_tuple_living_xid", "pk_relation_tuple"}
 
 func init() {
 	dbsql.Register(tracingDriverName, sqlmw.Driver(stdlib.GetDefaultDriver(), new(traceInterceptor)))
@@ -94,9 +98,13 @@ func init() {
 var (
 	psql = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
-	getRevision = psql.Select("MAX(id)").From(tableTransaction)
+	getRevision = psql.
+			Select(colXID, colSnapshot).
+			From(tableTransaction).
+			OrderByClause(fmt.Sprintf("%s DESC", colXID)).
+			Limit(1)
 
-	getRevisionRange = psql.Select("MIN(id)", "MAX(id)").From(tableTransaction)
+	createTxn = psql.Insert(tableTransaction).Columns(colMetadata)
 
 	getNow = psql.Select("NOW()")
 
@@ -112,111 +120,525 @@ type sqlFilter interface {
 //
 // This datastore is also tested to be compatible with CockroachDB.
 func NewPostgresDatastore(
+	ctx context.Context,
 	url string,
 	options ...Option,
 ) (datastore.Datastore, error) {
+	ds, err := newPostgresDatastore(ctx, url, primaryInstanceID, options...)
+	if err != nil {
+		return nil, err
+	}
+
+	return datastoreinternal.NewSeparatingContextDatastoreProxy(ds), nil
+}
+
+// NewReadOnlyPostgresDatastore initializes a SpiceDB datastore that uses a PostgreSQL
+// database by leveraging manual book-keeping to implement revisioning. This version is
+// read only and does not allow for write transactions.
+func NewReadOnlyPostgresDatastore(
+	ctx context.Context,
+	url string,
+	index uint32,
+	options ...Option,
+) (datastore.StrictReadDatastore, error) {
+	ds, err := newPostgresDatastore(ctx, url, int(index), options...)
+	if err != nil {
+		return nil, err
+	}
+
+	return datastoreinternal.NewSeparatingContextDatastoreProxy(ds), nil
+}
+
+func newPostgresDatastore(
+	ctx context.Context,
+	pgURL string,
+	replicaIndex int,
+	options ...Option,
+) (datastore.Datastore, error) {
+	isPrimary := replicaIndex == primaryInstanceID
 	config, err := generateConfig(options)
 	if err != nil {
-		return nil, fmt.Errorf(errUnableToInstantiate, err)
+		return nil, common.RedactAndLogSensitiveConnString(ctx, errUnableToInstantiate, err, pgURL)
 	}
 
-	// config must be initialized by ParseConfig
-	pgxConfig, err := pgxpool.ParseConfig(url)
+	// Parse the DB URI into configuration.
+	parsedConfig, err := pgxpool.ParseConfig(pgURL)
 	if err != nil {
-		return nil, fmt.Errorf(errUnableToInstantiate, err)
+		return nil, common.RedactAndLogSensitiveConnString(ctx, errUnableToInstantiate, err, pgURL)
 	}
 
-	if config.maxOpenConns != nil {
-		pgxConfig.MaxConns = int32(*config.maxOpenConns)
-	}
-	if config.minOpenConns != nil {
-		pgxConfig.MinConns = int32(*config.minOpenConns)
-	}
-	if config.connMaxIdleTime != nil {
-		pgxConfig.MaxConnIdleTime = *config.connMaxIdleTime
-	}
-	if config.connMaxLifetime != nil {
-		pgxConfig.MaxConnLifetime = *config.connMaxLifetime
-	}
-	if config.healthCheckPeriod != nil {
-		pgxConfig.HealthCheckPeriod = *config.healthCheckPeriod
+	// Setup the default custom plan setting, if applicable.
+	// Setup the default query execution mode setting, if applicable.
+	pgConfig := DefaultQueryExecMode(parsedConfig)
+
+	// Setup the credentials provider
+	var credentialsProvider datastore.CredentialsProvider
+	if config.credentialsProviderName != "" {
+		credentialsProvider, err = datastore.NewCredentialsProvider(ctx, config.credentialsProviderName)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	pgxConfig.ConnConfig.Logger = zerologadapter.NewLogger(log.Logger)
-
-	dbpool, err := pgxpool.ConnectConfig(context.Background(), pgxConfig)
+	// Setup the config for each of the read and write pools.
+	readPoolConfig := pgConfig.Copy()
+	includeQueryParametersInTraces := config.includeQueryParametersInTraces
+	err = config.readPoolOpts.ConfigurePgx(readPoolConfig, includeQueryParametersInTraces)
 	if err != nil {
-		return nil, fmt.Errorf(errUnableToInstantiate, err)
+		return nil, common.RedactAndLogSensitiveConnString(ctx, errUnableToInstantiate, err, pgURL)
+	}
+
+	readPoolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		RegisterTypes(conn.TypeMap())
+		return nil
+	}
+
+	var writePoolConfig *pgxpool.Config
+	if isPrimary {
+		writePoolConfig = pgConfig.Copy()
+		err = config.writePoolOpts.ConfigurePgx(writePoolConfig, includeQueryParametersInTraces)
+		if err != nil {
+			return nil, common.RedactAndLogSensitiveConnString(ctx, errUnableToInstantiate, err, pgURL)
+		}
+
+		writePoolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			RegisterTypes(conn.TypeMap())
+			return nil
+		}
+	}
+
+	if credentialsProvider != nil {
+		// add before connect callbacks to trigger the token
+		getToken := func(ctx context.Context, config *pgx.ConnConfig) error {
+			config.User, config.Password, err = credentialsProvider.Get(ctx, fmt.Sprintf("%s:%d", config.Host, config.Port), config.User)
+			return err
+		}
+		readPoolConfig.BeforeConnect = getToken
+
+		if isPrimary {
+			writePoolConfig.BeforeConnect = getToken
+		}
+	}
+
+	if config.migrationPhase != "" {
+		log.Info().
+			Str("phase", config.migrationPhase).
+			Msg("postgres configured to use intermediate migration phase")
+	}
+
+	initializationContext, cancelInit := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelInit()
+
+	readPool, err := pgxpool.NewWithConfig(initializationContext, readPoolConfig)
+	if err != nil {
+		return nil, common.RedactAndLogSensitiveConnString(ctx, errUnableToInstantiate, err, pgURL)
+	}
+
+	var writePool *pgxpool.Pool
+
+	if isPrimary {
+		wp, err := pgxpool.NewWithConfig(initializationContext, writePoolConfig)
+		if err != nil {
+			return nil, common.RedactAndLogSensitiveConnString(ctx, errUnableToInstantiate, err, pgURL)
+		}
+		writePool = wp
+	}
+
+	// Verify that the server supports commit timestamps
+	var trackTSOn string
+	if err := readPool.
+		QueryRow(initializationContext, "SHOW track_commit_timestamp;").
+		Scan(&trackTSOn); err != nil {
+		return nil, err
+	}
+
+	watchEnabled := trackTSOn == "on"
+	if !watchEnabled {
+		log.Warn().Msg("watch API disabled, postgres must be run with track_commit_timestamp=on")
 	}
 
 	if config.enablePrometheusStats {
-		collector := NewPgxpoolStatsCollector(dbpool, "spicedb")
-		err := prometheus.Register(collector)
-		if err != nil {
-			return nil, fmt.Errorf(errUnableToInstantiate, err)
+		replicaIndexStr := strconv.Itoa(replicaIndex)
+		dbname := "spicedb"
+		if replicaIndex != primaryInstanceID {
+			dbname = fmt.Sprintf("spicedb_replica_%s", replicaIndexStr)
 		}
-		err = prometheus.Register(gcDurationHistogram)
-		if err != nil {
-			return nil, fmt.Errorf(errUnableToInstantiate, err)
+
+		if err := prometheus.Register(pgxpoolprometheus.NewCollector(readPool, map[string]string{
+			"db_name":    dbname,
+			"pool_usage": "read",
+		})); err != nil {
+			return nil, err
 		}
-		err = prometheus.Register(gcRelationshipsClearedGauge)
-		if err != nil {
-			return nil, fmt.Errorf(errUnableToInstantiate, err)
+
+		if isPrimary {
+			if err := prometheus.Register(pgxpoolprometheus.NewCollector(writePool, map[string]string{
+				"db_name":    "spicedb",
+				"pool_usage": "write",
+			})); err != nil {
+				return nil, err
+			}
+			if err := common.RegisterGCMetrics(); err != nil {
+				return nil, err
+			}
 		}
-		err = prometheus.Register(gcTransactionsClearedGauge)
-		if err != nil {
-			return nil, fmt.Errorf(errUnableToInstantiate, err)
-		}
+	}
+
+	headMigration, err := migrations.DatabaseMigrations.HeadRevision()
+	if err != nil {
+		return nil, fmt.Errorf("invalid head migration found for postgres: %w", err)
 	}
 
 	gcCtx, cancelGc := context.WithCancel(context.Background())
 
-	querySplitter := common.TupleQuerySplitter{
-		Executor:         common.NewPGXExecutor(dbpool, nil),
-		UsersetBatchSize: int(config.splitAtUsersetCount),
+	quantizationPeriodNanos := config.revisionQuantization.Nanoseconds()
+	if quantizationPeriodNanos < 1 {
+		quantizationPeriodNanos = 1
 	}
+	revisionQuery := fmt.Sprintf(
+		querySelectRevision,
+		colXID,
+		tableTransaction,
+		colTimestamp,
+		quantizationPeriodNanos,
+		colSnapshot,
+	)
+
+	validTransactionQuery := fmt.Sprintf(
+		queryValidTransaction,
+		colXID,
+		tableTransaction,
+		colTimestamp,
+		config.gcWindow.Seconds(),
+		colSnapshot,
+	)
+
+	maxRevisionStaleness := time.Duration(float64(config.revisionQuantization.Nanoseconds())*
+		config.maxRevisionStalenessPercent) * time.Nanosecond
+
+	schema := common.NewSchemaInformationWithOptions(
+		common.WithRelationshipTableName(tableTuple),
+		common.WithColNamespace(colNamespace),
+		common.WithColObjectID(colObjectID),
+		common.WithColRelation(colRelation),
+		common.WithColUsersetNamespace(colUsersetNamespace),
+		common.WithColUsersetObjectID(colUsersetObjectID),
+		common.WithColUsersetRelation(colUsersetRelation),
+		common.WithColCaveatName(colCaveatContextName),
+		common.WithColCaveatContext(colCaveatContext),
+		common.WithColExpiration(colExpiration),
+		common.WithPaginationFilterType(common.TupleComparison),
+		common.WithPlaceholderFormat(sq.Dollar),
+		common.WithNowFunction("NOW"),
+		common.WithColumnOptimization(config.columnOptimizationOption),
+		common.WithExpirationDisabled(config.expirationDisabled),
+	)
 
 	datastore := &pgDatastore{
-		dburl:                    url,
-		dbpool:                   dbpool,
-		watchBufferLength:        config.watchBufferLength,
-		revisionFuzzingTimedelta: config.revisionFuzzingTimedelta,
-		gcWindowInverted:         -1 * config.gcWindow,
-		gcInterval:               config.gcInterval,
-		gcMaxOperationTime:       config.gcMaxOperationTime,
-		querySplitter:            querySplitter,
-		gcCtx:                    gcCtx,
-		cancelGc:                 cancelGc,
+		CachedOptimizedRevisions: revisions.NewCachedOptimizedRevisions(
+			maxRevisionStaleness,
+		),
+		MigrationValidator:      common.NewMigrationValidator(headMigration, config.allowedMigrations),
+		dburl:                   pgURL,
+		readPool:                pgxcommon.MustNewInterceptorPooler(readPool, config.queryInterceptor),
+		writePool:               nil, /* disabled by default */
+		watchBufferLength:       config.watchBufferLength,
+		watchBufferWriteTimeout: config.watchBufferWriteTimeout,
+		optimizedRevisionQuery:  revisionQuery,
+		validTransactionQuery:   validTransactionQuery,
+		gcWindow:                config.gcWindow,
+		gcInterval:              config.gcInterval,
+		gcTimeout:               config.gcMaxOperationTime,
+		analyzeBeforeStatistics: config.analyzeBeforeStatistics,
+		watchEnabled:            watchEnabled,
+		gcCtx:                   gcCtx,
+		cancelGc:                cancelGc,
+		readTxOptions:           pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly},
+		maxRetries:              config.maxRetries,
+		credentialsProvider:     credentialsProvider,
+		isPrimary:               isPrimary,
+		inStrictReadMode:        config.readStrictMode,
+		filterMaximumIDCount:    config.filterMaximumIDCount,
+		schema:                  *schema,
 	}
 
+	if isPrimary && config.readStrictMode {
+		return nil, spiceerrors.MustBugf("strict read mode is not supported on primary instances")
+	}
+
+	if isPrimary {
+		datastore.writePool = pgxcommon.MustNewInterceptorPooler(writePool, config.queryInterceptor)
+	}
+
+	datastore.SetOptimizedRevisionFunc(datastore.optimizedRevisionFunc)
+
 	// Start a goroutine for garbage collection.
-	if datastore.gcInterval > 0*time.Minute {
-		datastore.gcGroup, datastore.gcCtx = errgroup.WithContext(datastore.gcCtx)
-		datastore.gcGroup.Go(datastore.runGarbageCollector)
-	} else {
-		log.Warn().Msg("garbage collection disabled in postgres driver")
+	if isPrimary {
+		if datastore.gcInterval > 0*time.Minute && config.gcEnabled {
+			datastore.gcGroup, datastore.gcCtx = errgroup.WithContext(datastore.gcCtx)
+			datastore.gcGroup.Go(func() error {
+				return common.StartGarbageCollector(
+					datastore.gcCtx,
+					datastore,
+					datastore.gcInterval,
+					datastore.gcWindow,
+					datastore.gcTimeout,
+				)
+			})
+		} else {
+			log.Warn().Msg("datastore background garbage collection disabled")
+		}
 	}
 
 	return datastore, nil
 }
 
 type pgDatastore struct {
-	dburl                    string
-	dbpool                   *pgxpool.Pool
-	watchBufferLength        uint16
-	revisionFuzzingTimedelta time.Duration
-	gcWindowInverted         time.Duration
-	gcInterval               time.Duration
-	gcMaxOperationTime       time.Duration
-	querySplitter            common.TupleQuerySplitter
+	*revisions.CachedOptimizedRevisions
+	*common.MigrationValidator
 
-	gcGroup  *errgroup.Group
-	gcCtx    context.Context
-	cancelGc context.CancelFunc
+	dburl                          string
+	readPool, writePool            pgxcommon.ConnPooler
+	watchBufferLength              uint16
+	watchBufferWriteTimeout        time.Duration
+	optimizedRevisionQuery         string
+	validTransactionQuery          string
+	gcWindow                       time.Duration
+	gcInterval                     time.Duration
+	gcTimeout                      time.Duration
+	analyzeBeforeStatistics        bool
+	readTxOptions                  pgx.TxOptions
+	maxRetries                     uint8
+	watchEnabled                   bool
+	isPrimary                      bool
+	inStrictReadMode               bool
+	schema                         common.SchemaInformation
+	includeQueryParametersInTraces bool
+
+	credentialsProvider datastore.CredentialsProvider
+
+	gcGroup              *errgroup.Group
+	gcCtx                context.Context
+	cancelGc             context.CancelFunc
+	gcHasRun             atomic.Bool
+	filterMaximumIDCount uint16
 }
 
-func (pgd *pgDatastore) NamespaceCacheKey(namespaceName string, revision datastore.Revision) (string, error) {
-	return fmt.Sprintf("%s@%s", namespaceName, revision), nil
+func (pgd *pgDatastore) IsStrictReadModeEnabled() bool {
+	return pgd.inStrictReadMode
+}
+
+func (pgd *pgDatastore) SnapshotReader(revRaw datastore.Revision) datastore.Reader {
+	rev := revRaw.(postgresRevision)
+
+	queryFuncs := pgxcommon.QuerierFuncsFor(pgd.readPool)
+	if pgd.inStrictReadMode {
+		queryFuncs = strictReaderQueryFuncs{wrapped: queryFuncs, revision: rev}
+	}
+
+	executor := common.QueryRelationshipsExecutor{
+		Executor: pgxcommon.NewPGXQueryRelationshipsExecutor(queryFuncs),
+	}
+
+	return &pgReader{
+		queryFuncs,
+		executor,
+		buildLivingObjectFilterForRevision(rev),
+		pgd.filterMaximumIDCount,
+		pgd.schema,
+	}
+}
+
+// ReadWriteTx starts a read/write transaction, which will be committed if no error is
+// returned and rolled back if an error is returned.
+func (pgd *pgDatastore) ReadWriteTx(
+	ctx context.Context,
+	fn datastore.TxUserFunc,
+	opts ...options.RWTOptionsOption,
+) (datastore.Revision, error) {
+	if !pgd.isPrimary {
+		return datastore.NoRevision, spiceerrors.MustBugf("read-write transaction not supported on read-only datastore")
+	}
+
+	config := options.NewRWTOptionsWithOptions(opts...)
+
+	var err error
+	for i := uint8(0); i <= pgd.maxRetries; i++ {
+		var newXID xid8
+		var newSnapshot pgSnapshot
+		err = wrapError(pgx.BeginTxFunc(ctx, pgd.writePool, pgx.TxOptions{IsoLevel: pgx.Serializable}, func(tx pgx.Tx) error {
+			var err error
+			var metadata map[string]any
+			if config.Metadata != nil && len(config.Metadata.GetFields()) > 0 {
+				metadata = config.Metadata.AsMap()
+			}
+
+			newXID, newSnapshot, err = createNewTransaction(ctx, tx, metadata)
+			if err != nil {
+				return err
+			}
+
+			queryFuncs := pgxcommon.QuerierFuncsFor(pgd.readPool)
+			executor := common.QueryRelationshipsExecutor{
+				Executor: pgxcommon.NewPGXQueryRelationshipsExecutor(queryFuncs),
+			}
+
+			rwt := &pgReadWriteTXN{
+				&pgReader{
+					queryFuncs,
+					executor,
+					currentlyLivingObjects,
+					pgd.filterMaximumIDCount,
+					pgd.schema,
+				},
+				tx,
+				newXID,
+			}
+
+			return fn(ctx, rwt)
+		}))
+		if err != nil {
+			if !config.DisableRetries && errorRetryable(err) {
+				pgxcommon.SleepOnErr(ctx, err, i)
+				continue
+			}
+
+			return datastore.NoRevision, err
+		}
+
+		if i > 0 {
+			log.Debug().Uint8("retries", i).Msg("transaction succeeded after retry")
+		}
+
+		return postgresRevision{snapshot: newSnapshot.markComplete(newXID.Uint64), optionalTxID: newXID}, nil
+	}
+
+	if !config.DisableRetries {
+		err = fmt.Errorf("max retries exceeded: %w", err)
+	}
+
+	return datastore.NoRevision, err
+}
+
+const repairTransactionIDsOperation = "transaction-ids"
+
+func (pgd *pgDatastore) Repair(ctx context.Context, operationName string, outputProgress bool) error {
+	switch operationName {
+	case repairTransactionIDsOperation:
+		return pgd.repairTransactionIDs(ctx, outputProgress)
+
+	default:
+		return fmt.Errorf("unknown operation")
+	}
+}
+
+const batchSize = 10000
+
+func (pgd *pgDatastore) repairTransactionIDs(ctx context.Context, outputProgress bool) error {
+	conn, err := pgx.Connect(ctx, pgd.dburl)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(ctx)
+
+	// Get the current transaction ID.
+	currentMaximumID := 0
+	if err := conn.QueryRow(ctx, queryCurrentTransactionID).Scan(&currentMaximumID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("could not get current transaction ID: %w", err)
+		}
+	}
+
+	// Find the maximum transaction ID referenced in the transactions table.
+	referencedMaximumID := 0
+	if err := conn.QueryRow(ctx, queryLatestXID).Scan(&referencedMaximumID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("could not get maximum transaction ID: %w", err)
+		}
+	}
+
+	// The delta is what this needs to fill in.
+	log.Ctx(ctx).Info().Int64("current-maximum", int64(currentMaximumID)).Int64("referenced-maximum", int64(referencedMaximumID)).Msg("found transactions")
+	counterDelta := referencedMaximumID - currentMaximumID
+	if counterDelta < 0 {
+		return nil
+	}
+
+	var bar *progressbar.ProgressBar
+	if isatty.IsTerminal(os.Stderr.Fd()) && outputProgress {
+		bar = progressbar.Default(int64(counterDelta), "updating transactions counter")
+	}
+
+	for i := 0; i < counterDelta; i++ {
+		var batch pgx.Batch
+
+		batchCount := min(batchSize, counterDelta-i)
+		for j := 0; j < batchCount; j++ {
+			batch.Queue("begin;")
+			batch.Queue("select pg_current_xact_id();")
+			batch.Queue("rollback;")
+		}
+
+		br := conn.SendBatch(ctx, &batch)
+		if err := br.Close(); err != nil {
+			return err
+		}
+
+		i += batchCount - 1
+		if bar != nil {
+			if err := bar.Add(batchCount); err != nil {
+				return err
+			}
+		}
+	}
+
+	if bar != nil {
+		if err := bar.Close(); err != nil {
+			return err
+		}
+	}
+
+	log.Ctx(ctx).Info().Msg("completed revisions repair")
+	return nil
+}
+
+// RepairOperations returns the available repair operations for the datastore.
+func (pgd *pgDatastore) RepairOperations() []datastore.RepairOperation {
+	return []datastore.RepairOperation{
+		{
+			Name:        repairTransactionIDsOperation,
+			Description: "Brings the Postgres database up to the expected transaction ID (Postgres v15+ only)",
+		},
+	}
+}
+
+func wrapError(err error) error {
+	// If a unique constraint violation is returned, then its likely that the cause
+	// was an existing relationship given as a CREATE.
+	if cerr := pgxcommon.ConvertToWriteConstraintError(livingTupleConstraints, err); cerr != nil {
+		return cerr
+	}
+
+	if pgxcommon.IsSerializationError(err) {
+		return common.NewSerializationError(err)
+	}
+
+	if pgxcommon.IsReadOnlyTransactionError(err) {
+		return common.NewReadOnlyTransactionError(err)
+	}
+
+	// hack: pgx asyncClose usually happens after cancellation,
+	// but the reason for it being closed is not propagated
+	// and all we get is attempting to perform an operation
+	// on cancelled connection. This keeps the same error,
+	// but wrapped along a cancellation so that:
+	// - pgx logger does not log it
+	// - response is sent as canceled back to the client
+	if err != nil && err.Error() == "conn closed" {
+		return errors.Join(err, context.Canceled)
+	}
+
+	return err
 }
 
 func (pgd *pgDatastore) Close() error {
@@ -227,357 +649,131 @@ func (pgd *pgDatastore) Close() error {
 		log.Warn().Err(err).Msg("completed shutdown of postgres datastore")
 	}
 
-	pgd.dbpool.Close()
-	return nil
-}
+	pgd.readPool.Close()
 
-func (pgd *pgDatastore) runGarbageCollector() error {
-	log.Info().Dur("interval", pgd.gcInterval).Msg("garbage collection worker started for postgres driver")
-
-	for {
-		select {
-		case <-pgd.gcCtx.Done():
-			log.Info().Msg("shutting down garbage collection worker for postgres driver")
-			return pgd.gcCtx.Err()
-
-		case <-time.After(pgd.gcInterval):
-			err := pgd.collectGarbage()
-			if err != nil {
-				log.Warn().Err(err).Msg("error when attempting to perform garbage collection")
-			} else {
-				log.Debug().Msg("garbage collection completed for postgres")
-			}
-		}
-	}
-}
-
-func (pgd *pgDatastore) getNow(ctx context.Context) (time.Time, error) {
-	// Retrieve the `now` time from the database.
-	nowSQL, nowArgs, err := getNow.ToSql()
-	if err != nil {
-		return time.Now(), err
-	}
-
-	var now time.Time
-	err = pgd.dbpool.QueryRow(datastore.SeparateContextWithTracing(ctx), nowSQL, nowArgs...).Scan(&now)
-	if err != nil {
-		return time.Now(), err
-	}
-
-	// RelationTupleTransaction is not timezone aware
-	// Explicitly use UTC before using as a query arg
-	now = now.UTC()
-
-	return now, nil
-}
-
-func (pgd *pgDatastore) collectGarbage() error {
-	startTime := time.Now()
-	defer func() {
-		gcDurationHistogram.Observe(time.Since(startTime).Seconds())
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), pgd.gcMaxOperationTime)
-	defer cancel()
-
-	// Ensure the database is ready.
-	ready, err := pgd.IsReady(ctx)
-	if err != nil {
-		return err
-	}
-
-	if !ready {
-		log.Ctx(ctx).Warn().Msg("cannot perform postgres garbage collection: postgres driver is not yet ready")
-		return nil
-	}
-
-	now, err := pgd.getNow(ctx)
-	if err != nil {
-		return err
-	}
-
-	before := now.Add(pgd.gcWindowInverted)
-	log.Ctx(ctx).Debug().Time("before", before).Msg("running postgres garbage collection")
-	_, _, err = pgd.collectGarbageBefore(ctx, before)
-	return err
-}
-
-func (pgd *pgDatastore) collectGarbageBefore(ctx context.Context, before time.Time) (int64, int64, error) {
-	// Find the highest transaction ID before the GC window.
-	sql, args, err := getRevision.Where(sq.Lt{colTimestamp: before}).ToSql()
-	if err != nil {
-		return 0, 0, err
-	}
-
-	value := pgtype.Int8{}
-	err = pgd.dbpool.QueryRow(
-		datastore.SeparateContextWithTracing(ctx), sql, args...,
-	).Scan(&value)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	if value.Status != pgtype.Present {
-		log.Ctx(ctx).Debug().Time("before", before).Msg("no stale transactions found in the datastore")
-		return 0, 0, nil
-	}
-
-	var highest uint64
-	err = value.AssignTo(&highest)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	log.Ctx(ctx).Trace().Uint64("highestTransactionId", highest).Msg("retrieved transaction ID for GC")
-
-	return pgd.collectGarbageForTransaction(ctx, highest)
-}
-
-func (pgd *pgDatastore) collectGarbageForTransaction(ctx context.Context, highest uint64) (int64, int64, error) {
-	// Delete any relationship rows with deleted_transaction <= the transaction ID.
-	relCount, err := pgd.batchDelete(ctx, tableTuple, sq.LtOrEq{colDeletedTxn: highest})
-	if err != nil {
-		return 0, 0, err
-	}
-
-	log.Ctx(ctx).Trace().Uint64("highestTransactionId", highest).Int64("relationshipsDeleted", relCount).Msg("deleted stale relationships")
-	gcRelationshipsClearedGauge.Set(float64(relCount))
-
-	// Delete all transaction rows with ID < the transaction ID. We don't delete the transaction
-	// itself to ensure there is always at least one transaction present.
-	transactionCount, err := pgd.batchDelete(ctx, tableTransaction, sq.Lt{colID: highest})
-	if err != nil {
-		return relCount, 0, err
-	}
-
-	log.Ctx(ctx).Trace().Uint64("highestTransactionId", highest).Int64("transactionsDeleted", transactionCount).Msg("deleted stale transactions")
-	gcTransactionsClearedGauge.Set(float64(transactionCount))
-	return relCount, transactionCount, nil
-}
-
-func (pgd *pgDatastore) batchDelete(ctx context.Context, tableName string, filter sqlFilter) (int64, error) {
-	sql, args, err := psql.Select("id").From(tableName).Where(filter).Limit(batchDeleteSize).ToSql()
-	if err != nil {
-		return -1, err
-	}
-
-	query := fmt.Sprintf(`WITH rows AS (%s)
-		  DELETE FROM %s
-		  WHERE id IN (SELECT id FROM rows);
-	`, sql, tableName)
-
-	var deletedCount int64
-	for {
-		cr, err := pgd.dbpool.Exec(ctx, query, args...)
-		if err != nil {
-			return deletedCount, err
-		}
-
-		rowsDeleted := cr.RowsAffected()
-		deletedCount += rowsDeleted
-		if rowsDeleted < batchDeleteSize {
-			break
-		}
-	}
-
-	return deletedCount, nil
-}
-
-func (pgd *pgDatastore) IsReady(ctx context.Context) (bool, error) {
-	headMigration, err := migrations.DatabaseMigrations.HeadRevision()
-	if err != nil {
-		return false, fmt.Errorf("invalid head migration found for postgres: %w", err)
-	}
-
-	currentRevision, err := migrations.NewAlembicPostgresDriver(pgd.dburl)
-	if err != nil {
-		return false, err
-	}
-	defer currentRevision.Close()
-
-	version, err := currentRevision.Version()
-	if err != nil {
-		return false, err
-	}
-
-	return version == headMigration, nil
-}
-
-func (pgd *pgDatastore) HeadRevision(ctx context.Context) (datastore.Revision, error) {
-	ctx, span := tracer.Start(ctx, "HeadRevision")
-	defer span.End()
-
-	revision, err := pgd.loadRevision(ctx)
-	if err != nil {
-		return datastore.NoRevision, err
-	}
-
-	return revisionFromTransaction(revision), nil
-}
-
-func (pgd *pgDatastore) OptimizedRevision(ctx context.Context) (datastore.Revision, error) {
-	ctx, span := tracer.Start(ctx, "OptimizedRevision")
-	defer span.End()
-
-	lower, upper, err := pgd.computeRevisionRange(ctx, -1*pgd.revisionFuzzingTimedelta)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return datastore.NoRevision, fmt.Errorf(errRevision, err)
-	}
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		revision, err := pgd.loadRevision(ctx)
-		if err != nil {
-			return datastore.NoRevision, err
-		}
-
-		return revisionFromTransaction(revision), nil
-	}
-
-	if upper-lower == 0 {
-		return revisionFromTransaction(upper), nil
-	}
-
-	return revisionFromTransaction(uint64(rand.Intn(int(upper-lower))) + lower), nil
-}
-
-func (pgd *pgDatastore) CheckRevision(ctx context.Context, revision datastore.Revision) error {
-	ctx, span := tracer.Start(ctx, "CheckRevision")
-	defer span.End()
-
-	revisionTx := transactionFromRevision(revision)
-
-	lower, upper, err := pgd.computeRevisionRange(ctx, pgd.gcWindowInverted)
-	if err == nil {
-		if revisionTx < lower {
-			return datastore.NewInvalidRevisionErr(revision, datastore.RevisionStale)
-		} else if revisionTx > upper {
-			return datastore.NewInvalidRevisionErr(revision, datastore.RevisionInFuture)
-		}
-
-		return nil
-	}
-
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf(errCheckRevision, err)
-	}
-
-	// There are no unexpired rows
-	sql, args, err := getRevision.ToSql()
-	if err != nil {
-		return fmt.Errorf(errCheckRevision, err)
-	}
-
-	var highest uint64
-	err = pgd.dbpool.QueryRow(
-		datastore.SeparateContextWithTracing(ctx), sql, args...,
-	).Scan(&highest)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return datastore.NewInvalidRevisionErr(revision, datastore.CouldNotDetermineRevision)
-	}
-	if err != nil {
-		return fmt.Errorf(errCheckRevision, err)
-	}
-
-	if revisionTx < highest {
-		return datastore.NewInvalidRevisionErr(revision, datastore.RevisionStale)
-	} else if revisionTx > highest {
-		return datastore.NewInvalidRevisionErr(revision, datastore.RevisionInFuture)
+	if pgd.writePool != nil {
+		pgd.writePool.Close()
 	}
 
 	return nil
 }
 
-func (pgd *pgDatastore) loadRevision(ctx context.Context) (uint64, error) {
-	ctx, span := tracer.Start(ctx, "loadRevision")
-	defer span.End()
-
-	sql, args, err := getRevision.ToSql()
-	if err != nil {
-		return 0, fmt.Errorf(errRevision, err)
+func errorRetryable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
 	}
 
-	var revision uint64
-	err = pgd.dbpool.QueryRow(datastore.SeparateContextWithTracing(ctx), sql, args...).Scan(&revision)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf(errRevision, err)
+	if pgconn.SafeToRetry(err) {
+		return true
 	}
 
-	return revision, nil
+	if pgxcommon.IsSerializationError(err) {
+		return true
+	}
+
+	log.Warn().Err(err).Msg("unable to determine if pgx error is retryable")
+	return false
 }
 
-func (pgd *pgDatastore) computeRevisionRange(ctx context.Context, windowInverted time.Duration) (uint64, uint64, error) {
-	ctx, span := tracer.Start(ctx, "computeRevisionRange")
-	defer span.End()
-
-	nowSQL, nowArgs, err := getNow.ToSql()
+func (pgd *pgDatastore) ReadyState(ctx context.Context) (datastore.ReadyState, error) {
+	pgDriver, err := migrations.NewAlembicPostgresDriver(ctx, pgd.dburl, pgd.credentialsProvider, pgd.includeQueryParametersInTraces)
 	if err != nil {
-		return 0, 0, err
+		return datastore.ReadyState{}, err
 	}
+	defer pgDriver.Close(ctx)
 
-	var now time.Time
-	err = pgd.dbpool.QueryRow(datastore.SeparateContextWithTracing(ctx), nowSQL, nowArgs...).Scan(&now)
+	version, err := pgDriver.Version(ctx)
 	if err != nil {
-		return 0, 0, err
+		return datastore.ReadyState{}, err
 	}
-	// RelationTupleTransaction is not timezone aware
-	// Explicitly use UTC before using as a query arg
-	now = now.UTC()
 
-	span.AddEvent("DB returned value for NOW()")
-
-	lowerBound := now.Add(windowInverted)
-
-	sql, args, err := getRevisionRange.Where(sq.GtOrEq{colTimestamp: lowerBound}).ToSql()
+	state := pgd.MigrationReadyState(version)
+	if !state.IsReady {
+		return state, nil
+	}
+	// Ensure a datastore ID is present. This ensures the tables have not been truncated.
+	uniqueID, err := pgd.datastoreUniqueID(ctx)
 	if err != nil {
-		return 0, 0, err
+		return datastore.ReadyState{}, fmt.Errorf("database validation failed: %w; if you have previously run `TRUNCATE`, this database is no longer valid and must be remigrated. See: https://spicedb.dev/d/truncate-unsupported", err)
+	}
+	log.Trace().Str("unique_id", uniqueID).Msg("postgres datastore unique ID")
+	return state, nil
+}
+
+func (pgd *pgDatastore) Features(ctx context.Context) (*datastore.Features, error) {
+	return pgd.OfflineFeatures()
+}
+
+func (pgd *pgDatastore) OfflineFeatures() (*datastore.Features, error) {
+	if pgd.watchEnabled {
+		return &datastore.Features{
+			Watch: datastore.Feature{
+				Status: datastore.FeatureSupported,
+			},
+			IntegrityData: datastore.Feature{
+				Status: datastore.FeatureUnsupported,
+			},
+			ContinuousCheckpointing: datastore.Feature{
+				Status: datastore.FeatureUnsupported,
+			},
+			WatchEmitsImmediately: datastore.Feature{
+				Status: datastore.FeatureUnsupported,
+			},
+		}, nil
 	}
 
-	var lower, upper dbsql.NullInt64
-	// Setting QuerySimpleProtocol to true bypasses the pgx statement prep and caching.
-	// Using a non-prepared statement prevents the automatic plan selection behavior that can lead Postgres selecting
-	// a poor performing general plan after 5 custom plan queries. Non-prepared statements will use a custom plan each time.
-	// https://github.com/authzed/spicedb/issues/486
-	err = pgd.dbpool.QueryRow(
-		datastore.SeparateContextWithTracing(ctx),
-		sql,
-		append([]interface{}{pgx.QuerySimpleProtocol(true)}, args...)...,
-	).Scan(&lower, &upper)
-	if err != nil {
-		return 0, 0, err
+	return &datastore.Features{
+		Watch: datastore.Feature{
+			Status: datastore.FeatureUnsupported,
+		},
+		IntegrityData: datastore.Feature{
+			Status: datastore.FeatureUnsupported,
+		},
+		ContinuousCheckpointing: datastore.Feature{
+			Status: datastore.FeatureUnsupported,
+		},
+	}, nil
+}
+
+func buildLivingObjectFilterForRevision(revision postgresRevision) queryFilterer {
+	createdBeforeTXN := sq.Expr(fmt.Sprintf(
+		snapshotAlive,
+		colCreatedXid,
+	), revision.snapshot, true)
+
+	deletedAfterTXN := sq.Expr(fmt.Sprintf(
+		snapshotAlive,
+		colDeletedXid,
+	), revision.snapshot, false)
+
+	return func(original sq.SelectBuilder) sq.SelectBuilder {
+		return original.Where(createdBeforeTXN).Where(deletedAfterTXN)
+	}
+}
+
+func currentlyLivingObjects(original sq.SelectBuilder) sq.SelectBuilder {
+	return original.Where(sq.Eq{colDeletedXid: liveDeletedTxnID})
+}
+
+// DefaultQueryExecMode parses a Postgres URI and determines if a default_query_exec_mode
+// has been specified. If not, it defaults to "exec".
+// SpiceDB queries have high variability of arguments and rarely benefit from using prepared statements.
+// The default and recommended query exec mode is 'exec', which has shown the best performance under various
+// synthetic workloads. See more in https://spicedb.dev/d/query-exec-mode.
+//
+// The docs for the different execution modes offered by pgx may be found
+// here: https://pkg.go.dev/github.com/jackc/pgx/v5#QueryExecMode
+func DefaultQueryExecMode(poolConfig *pgxpool.Config) *pgxpool.Config {
+	if !strings.Contains(poolConfig.ConnString(), "default_query_exec_mode") {
+		// the execution mode was not overridden by the user
+		poolConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+		return poolConfig
 	}
 
-	span.AddEvent("DB returned revision range")
-
-	if !lower.Valid || !upper.Valid {
-		return 0, 0, pgx.ErrNoRows
-	}
-
-	return uint64(lower.Int64), uint64(upper.Int64), nil
+	log.Info().
+		Str("details-url", "https://spicedb.dev/d/query-exec-mode").
+		Msg("found default_query_exec_mode in DB URI; leaving as-is")
+	return poolConfig
 }
 
-func createNewTransaction(ctx context.Context, tx pgx.Tx) (newTxnID uint64, err error) {
-	ctx, span := tracer.Start(ctx, "computeNewTransaction")
-	defer span.End()
-
-	err = tx.QueryRow(ctx, createTxn).Scan(&newTxnID)
-	return
-}
-
-func revisionFromTransaction(txID uint64) datastore.Revision {
-	return decimal.NewFromInt(int64(txID))
-}
-
-func transactionFromRevision(revision datastore.Revision) uint64 {
-	return uint64(revision.IntPart())
-}
-
-func filterToLivingObjects(original sq.SelectBuilder, revision datastore.Revision) sq.SelectBuilder {
-	return original.Where(sq.LtOrEq{colCreatedTxn: transactionFromRevision(revision)}).
-		Where(sq.Or{
-			sq.Eq{colDeletedTxn: liveDeletedTxnID},
-			sq.Gt{colDeletedTxn: revision},
-		})
-}
+var _ datastore.Datastore = &pgDatastore{}

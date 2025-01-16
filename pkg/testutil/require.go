@@ -4,6 +4,7 @@ package testutil
 
 import (
 	"testing"
+	"time"
 
 	v0 "github.com/authzed/authzed-go/proto/authzed/api/v0"
 
@@ -22,31 +23,47 @@ func RequireEqualEmptyNil(t *testing.T, expected, actual interface{}, msgAndArgs
 			v0.RelationTuple{},
 			v0.ObjectAndRelation{},
 			v0.RelationReference{},
-			v0.Relation{},
 			v0.User_Userset{},
 			v0.User{},
 			v0.EditCheckResult{},
-			v0.RelationTupleTreeNode_IntermediateNode{},
 			v0.EditCheckResultValidationError{},
 			v0.DeveloperError{},
-			v0.RelationTupleTreeNode{},
-			v0.RelationTupleTreeNode_LeafNode{},
-			v0.DirectUserset{},
-			v0.SetOperationUserset{},
 			core.RelationTuple{},
 			core.ObjectAndRelation{},
 			core.RelationReference{},
 			core.Relation{},
-			core.User_Userset{},
-			core.User{},
 			core.RelationTupleTreeNode_IntermediateNode{},
 			core.RelationTupleTreeNode{},
 			core.RelationTupleTreeNode_LeafNode{},
-			core.DirectUserset{},
+			core.DirectSubjects{},
 			core.SetOperationUserset{}),
 		cmpopts.EquateEmpty(),
 	}
 
 	msgAndArgs = append(msgAndArgs, cmp.Diff(expected, actual, opts...))
 	require.Truef(t, cmp.Equal(expected, actual, opts...), "Should be equal", msgAndArgs...)
+}
+
+// RequireWithin requires that the runner complete its execution within the specified duration.
+func RequireWithin(t *testing.T, runner func(t *testing.T), timeout time.Duration) {
+	t.Helper()
+
+	ch := make(chan bool, 1)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	go (func() {
+		t.Helper()
+		runner(t)
+		ch <- true
+	})()
+
+	select {
+	case <-timer.C:
+		require.Failf(t, "timed out waiting for runner", "expected to complete in %v", timeout)
+
+	case <-ch:
+		timer.Stop()
+		return
+	}
 }

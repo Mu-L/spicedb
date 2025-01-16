@@ -11,14 +11,21 @@ const (
 	NodeTypeError   NodeType = iota // error occurred; value is text of error
 	NodeTypeFile                    // The file root node
 	NodeTypeComment                 // A single or multiline comment
+	NodeTypeUseFlag                 // A use flag
 
-	NodeTypeDefinition // A definition.
+	NodeTypeDefinition       // A definition.
+	NodeTypeCaveatDefinition // A caveat definition.
+
+	NodeTypeCaveatParameter  // A caveat parameter.
+	NodeTypeCaveatExpression // A caveat expression.
 
 	NodeTypeRelation   // A relation
 	NodeTypePermission // A permission
 
 	NodeTypeTypeReference         // A type reference
 	NodeTypeSpecificTypeReference // A reference to a specific type.
+	NodeTypeCaveatReference       // A caveat reference under a type.
+	NodeTypeTraitReference        // A trait reference under a typr.
 
 	NodeTypeUnionExpression
 	NodeTypeIntersectExpression
@@ -28,6 +35,8 @@ const (
 
 	NodeTypeIdentifier    // An identifier under an expression.
 	NodeTypeNilExpression // A nil keyword
+
+	NodeTypeCaveatTypeReference // A type reference for a caveat parameter.
 )
 
 const (
@@ -65,11 +74,58 @@ const (
 	NodeCommentPredicateValue = "comment-value"
 
 	//
+	// NodeTypeUseFlag
+	//
+
+	// The name of the use flag.
+	NodeUseFlagPredicateName = "use-flag-name"
+
+	//
 	// NodeTypeDefinition
 	//
 
 	// The name of the definition
 	NodeDefinitionPredicateName = "definition-name"
+
+	//
+	// NodeTypeCaveatDefinition
+	//
+
+	// The name of the definition
+	NodeCaveatDefinitionPredicateName = "caveat-definition-name"
+
+	// The parameters for the definition.
+	NodeCaveatDefinitionPredicateParameters = "parameters"
+
+	// The link to the expression for the definition.
+	NodeCaveatDefinitionPredicateExpession = "caveat-definition-expression"
+
+	//
+	// NodeTypeCaveatExpression
+	//
+
+	// The raw CEL expression, in string form.
+	NodeCaveatExpressionPredicateExpression = "caveat-expression-expressionstr"
+
+	//
+	// NodeTypeCaveatParameter
+	//
+
+	// The name of the parameter
+	NodeCaveatParameterPredicateName = "caveat-parameter-name"
+
+	// The defined type of the caveat parameter.
+	NodeCaveatParameterPredicateType = "caveat-parameter-type"
+
+	//
+	// NodeTypeCaveatTypeReference
+	//
+
+	// The type for the caveat type reference.
+	NodeCaveatTypeReferencePredicateType = "type-name"
+
+	// The child type(s) for the type reference.
+	NodeCaveatTypeReferencePredicateChildTypes = "child-types"
 
 	//
 	// NodeTypeRelation + NodeTypePermission
@@ -105,12 +161,39 @@ const (
 	// A wildcard under a type reference.
 	NodeSpecificReferencePredicateWildcard = "type-wildcard"
 
+	// A caveat under a type reference.
+	NodeSpecificReferencePredicateCaveat = "caveat"
+
+	// A trait under a type reference.
+	NodeSpecificReferencePredicateTrait = "trait"
+
+	//
+	// NodeTypeCaveatReference
+	//
+
+	// The caveat name under the caveat.
+	NodeCaveatPredicateCaveat = "caveat-name"
+
+	//
+	// NodeTypeTraitReference
+	//
+
+	// The trait name under the trait.
+	NodeTraitPredicateTrait = "trait-name"
+
 	//
 	// NodeTypePermission
 	//
 
 	// The expression to compute the permission.
 	NodePermissionPredicateComputeExpression = "compute-expression"
+
+	//
+	// NodeTypeArrowExpression
+	//
+
+	// The name of the function in the arrow expression.
+	NodeArrowExpressionFunctionName = "function-name"
 
 	//
 	// NodeTypeIdentifer

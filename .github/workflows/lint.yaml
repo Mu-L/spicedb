@@ -7,42 +7,43 @@ on:  # yamllint disable-line rule:truthy
       - "main"
   pull_request:
     branches: ["*"]
+  merge_group:
+    types:
+      - "checks_requested"
 jobs:
+  go-license-check:
+    name: "License Check"
+    runs-on: "buildjet-4vcpu-ubuntu-2204"
+    steps:
+      - uses: "actions/checkout@v4"
+      - uses: "authzed/actions/setup-go@main"
+      - name: "Check Licenses"
+        uses: "authzed/actions/go-license-check@main"
+        with:
+          ignore: "buf.build"  # Has no license information
+
   go-lint:
     name: "Lint Go"
-    runs-on: "ubuntu-latest"
+    runs-on: "buildjet-4vcpu-ubuntu-2204"
     steps:
-      - uses: "actions/checkout@v3"
-      - uses: "actions/setup-go@v3"
+      - uses: "actions/checkout@v4"
+      - uses: "authzed/actions/setup-go@main"
+      - name: "Lint Go"
+        run: "go run mage.go lint:go"
+      - uses: "chainguard-dev/actions/nodiff@main"
         with:
-          go-version: "^1.17"
-      - uses: "authzed/actions/gofumpt@main"
-      - uses: "authzed/actions/go-mod-tidy@main"
-      - uses: "authzed/actions/go-generate@main"
-      - uses: "authzed/actions/golangci-lint@main"
+          path: ""
+          fixup-command: "go run mage.go lint:go"
 
   extra-lint:
     name: "Lint YAML & Markdown"
-    runs-on: "ubuntu-latest"
+    runs-on: "buildjet-2vcpu-ubuntu-2204"
     steps:
-      - uses: "actions/checkout@v3"
-      - uses: "authzed/actions/yaml-lint@main"
-      - uses: "instrumenta/kubeval-action@5915e4adba5adccac07cb156b82e54c3fed74921"
+      - uses: "actions/checkout@v4"
+      - uses: "authzed/actions/setup-go@main"
+      - name: "Lint Everything Else"
+        run: "go run mage.go lint:extra"
+      - uses: "chainguard-dev/actions/nodiff@main"
         with:
-          files: "k8s"
-      - uses: "authzed/actions/markdown-lint@main"
-
-  codeql:
-    name: "Analyze with CodeQL"
-    runs-on: "ubuntu-latest"
-    permissions:
-      actions: "read"
-      contents: "read"
-      security-events: "write"
-    strategy:
-      fail-fast: false
-      matrix:
-        language: ["go"]
-    steps:
-      - uses: "actions/checkout@v3"
-      - uses: "authzed/actions/codeql@main"
+          path: ""
+          fixup-command: "go run mage.go lint:extra"
