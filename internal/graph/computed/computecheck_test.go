@@ -14,8 +14,8 @@ import (
 	"github.com/authzed/spicedb/internal/dispatch/graph"
 	"github.com/authzed/spicedb/internal/graph/computed"
 	log "github.com/authzed/spicedb/internal/logging"
-	datastoremw "github.com/authzed/spicedb/internal/middleware/datastore"
 	caveattypes "github.com/authzed/spicedb/pkg/caveats/types"
+	"github.com/authzed/spicedb/pkg/datalayer"
 	"github.com/authzed/spicedb/pkg/datastore"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
@@ -809,8 +809,8 @@ func TestComputeCheckWithCaveats(t *testing.T) {
 
 			dispatch, err := graph.NewLocalOnlyDispatcher(graph.MustNewDefaultDispatcherParametersForTesting())
 			require.NoError(t, err)
-			ctx := log.Logger.WithContext(datastoremw.ContextWithHandle(t.Context()))
-			require.NoError(t, datastoremw.SetInContext(ctx, ds))
+			ctx := log.Logger.WithContext(datalayer.ContextWithHandle(t.Context()))
+			require.NoError(t, datalayer.SetInContext(ctx, datalayer.NewDataLayer(ds)))
 
 			revision, err := writeCaveatedTuples(ctx, t, ds, tt.schema, tt.updates)
 			require.NoError(t, err)
@@ -860,8 +860,8 @@ func TestComputeCheckError(t *testing.T) {
 
 	dispatch, err := graph.NewLocalOnlyDispatcher(graph.MustNewDefaultDispatcherParametersForTesting())
 	require.NoError(t, err)
-	ctx := log.Logger.WithContext(datastoremw.ContextWithHandle(t.Context()))
-	require.NoError(t, datastoremw.SetInContext(ctx, ds))
+	ctx := log.Logger.WithContext(datalayer.ContextWithHandle(t.Context()))
+	require.NoError(t, datalayer.SetInContext(ctx, datalayer.NewDataLayer(ds)))
 
 	_, _, err = computed.ComputeCheck(ctx, dispatch,
 		caveattypes.Default.TypeSet,
@@ -885,8 +885,8 @@ func TestComputeBulkCheck(t *testing.T) {
 
 	dispatch, err := graph.NewLocalOnlyDispatcher(graph.MustNewDefaultDispatcherParametersForTesting())
 	require.NoError(t, err)
-	ctx := log.Logger.WithContext(datastoremw.ContextWithHandle(t.Context()))
-	require.NoError(t, datastoremw.SetInContext(ctx, ds))
+	ctx := log.Logger.WithContext(datalayer.ContextWithHandle(t.Context()))
+	require.NoError(t, datalayer.SetInContext(ctx, datalayer.NewDataLayer(ds)))
 
 	revision, err := writeCaveatedTuples(ctx, t, ds, `
 	definition user {}

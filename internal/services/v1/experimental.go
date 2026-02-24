@@ -23,7 +23,6 @@ import (
 	"github.com/authzed/spicedb/internal/dispatch"
 	log "github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/internal/middleware"
-	datastoremw "github.com/authzed/spicedb/internal/middleware/datastore"
 	"github.com/authzed/spicedb/internal/middleware/handwrittenvalidation"
 	"github.com/authzed/spicedb/internal/middleware/perfinsights"
 	"github.com/authzed/spicedb/internal/middleware/streamtimeout"
@@ -33,6 +32,7 @@ import (
 	"github.com/authzed/spicedb/internal/services/v1/options"
 	caveattypes "github.com/authzed/spicedb/pkg/caveats/types"
 	"github.com/authzed/spicedb/pkg/cursor"
+	"github.com/authzed/spicedb/pkg/datalayer"
 	"github.com/authzed/spicedb/pkg/datastore"
 	dsoptions "github.com/authzed/spicedb/pkg/datastore/options"
 	"github.com/authzed/spicedb/pkg/datastore/queryshape"
@@ -241,10 +241,10 @@ func extractBatchNewReferencedNamespacesAndCaveats(
 func (es *experimentalServer) BulkImportRelationships(stream v1.ExperimentalService_BulkImportRelationshipsServer) error {
 	perfinsights.SetInContext(stream.Context(), perfinsights.NoLabels)
 
-	ds := datastoremw.MustFromContext(stream.Context())
+	dl := datalayer.MustFromContext(stream.Context())
 
 	var numWritten uint64
-	if _, err := ds.ReadWriteTx(stream.Context(), func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+	if _, err := dl.ReadWriteTx(stream.Context(), func(ctx context.Context, rwt datalayer.ReadWriteTransaction) error {
 		loadedNamespaces := make(map[string]*schema.Definition, 2)
 		loadedCaveats := make(map[string]*core.CaveatDefinition, 0)
 
@@ -256,45 +256,40 @@ func (es *experimentalServer) BulkImportRelationships(stream v1.ExperimentalServ
 			caveat:                 core.ContextualizedCaveat{},
 			caveatTypeSet:          es.caveatTypeSet,
 		}
+		sr, err := rwt.ReadSchema()
+		if err != nil {
+			return err
+		}
 
 		var streamWritten uint64
-		var err error
 		for ; adapter.err == nil && err == nil; streamWritten, err = rwt.BulkLoad(stream.Context(), adapter) {
 			numWritten += streamWritten
 
 			// The stream has terminated because we're awaiting namespace and/or caveat information
-			schemaReader, err := rwt.SchemaReader()
-			if err != nil {
-				return err
-			}
 			if len(adapter.awaitingNamespaces) > 0 {
-				foundDefs, err := schemaReader.LookupTypeDefinitionsByNames(stream.Context(), adapter.awaitingNamespaces)
+				foundDefs, err := sr.LookupTypeDefinitionsByNames(stream.Context(), adapter.awaitingNamespaces)
 				if err != nil {
 					return err
 				}
 
-				for _, def := range foundDefs {
-					if nsDef, ok := def.(*core.NamespaceDefinition); ok {
-						newDef, err := schema.NewDefinition(nsDef)
-						if err != nil {
-							return err
-						}
-						loadedNamespaces[nsDef.Name] = newDef
+				for _, nsDef := range foundDefs {
+					newDef, err := schema.NewDefinition(nsDef)
+					if err != nil {
+						return err
 					}
+					loadedNamespaces[nsDef.Name] = newDef
 				}
 
 				adapter.awaitingNamespaces = nil
 			}
 			if len(adapter.awaitingCaveats) > 0 {
-				foundCaveatDefs, err := schemaReader.LookupCaveatDefinitionsByNames(stream.Context(), adapter.awaitingCaveats)
+				foundCaveatDefs, err := sr.LookupCaveatDefinitionsByNames(stream.Context(), adapter.awaitingCaveats)
 				if err != nil {
 					return err
 				}
 
-				for _, def := range foundCaveatDefs {
-					if caveatDef, ok := def.(*core.CaveatDefinition); ok {
-						loadedCaveats[caveatDef.Name] = caveatDef
-					}
+				for name, caveatDef := range foundCaveatDefs {
+					loadedCaveats[name] = caveatDef
 				}
 
 				adapter.awaitingCaveats = nil
@@ -330,13 +325,13 @@ func (es *experimentalServer) BulkExportRelationships(
 		return shared.RewriteErrorWithoutConfig(ctx, err)
 	}
 
-	return BulkExport(ctx, datastoremw.MustFromContext(ctx), es.maxBatchSize, req, atRevision, resp.Send)
+	return BulkExport(ctx, datalayer.MustFromContext(ctx), es.maxBatchSize, req, atRevision, resp.Send)
 }
 
-// BulkExport implements the BulkExportRelationships API functionality. Given a datastore.Datastore, it will
+// BulkExport implements the BulkExportRelationships API functionality. Given a datalayer.DataLayer, it will
 // export stream via the sender all relationships matched by the incoming request.
 // If no cursor is provided, it will fallback to the provided revision.
-func BulkExport(ctx context.Context, ds datastore.ReadOnlyDatastore, batchSize uint64, req *v1.BulkExportRelationshipsRequest, fallbackRevision datastore.Revision, sender func(response *v1.BulkExportRelationshipsResponse) error) error {
+func BulkExport(ctx context.Context, dl datalayer.DataLayer, batchSize uint64, req *v1.BulkExportRelationshipsRequest, fallbackRevision datastore.Revision, sender func(response *v1.BulkExportRelationshipsResponse) error) error {
 	if req.OptionalLimit > 0 && uint64(req.OptionalLimit) > batchSize {
 		return shared.RewriteErrorWithoutConfig(ctx, NewExceedsMaximumLimitErr(uint64(req.OptionalLimit), batchSize))
 	}
@@ -346,15 +341,20 @@ func BulkExport(ctx context.Context, ds datastore.ReadOnlyDatastore, batchSize u
 	var cur dsoptions.Cursor
 	if req.OptionalCursor != nil {
 		var err error
-		atRevision, curNamespace, cur, err = decodeCursor(ds, req.OptionalCursor)
+		atRevision, curNamespace, cur, err = decodeCursor(dl, req.OptionalCursor)
 		if err != nil {
 			return shared.RewriteErrorWithoutConfig(ctx, err)
 		}
 	}
 
-	reader := ds.SnapshotReader(atRevision)
+	reader := dl.SnapshotReader(atRevision)
 
-	namespaces, err := reader.LegacyListAllNamespaces(ctx)
+	sr, err := reader.ReadSchema()
+	if err != nil {
+		return shared.RewriteErrorWithoutConfig(ctx, err)
+	}
+
+	namespaces, err := sr.ListAllTypeDefinitions(ctx)
 	if err != nil {
 		return shared.RewriteErrorWithoutConfig(ctx, err)
 	}
@@ -551,8 +551,8 @@ func (es *experimentalServer) ExperimentalReflectSchema(ctx context.Context, req
 		}
 	}
 
-	ds := datastoremw.MustFromContext(ctx)
-	readAt, err := zedtoken.NewFromRevision(ctx, atRevision, ds)
+	dl := datalayer.MustFromContext(ctx)
+	readAt, err := zedtoken.NewFromRevision(ctx, atRevision, dl)
 	if err != nil {
 		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
 	}
@@ -599,8 +599,12 @@ func (es *experimentalServer) ExperimentalComputablePermissions(ctx context.Cont
 		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
 	}
 
-	ds := datastoremw.MustFromContext(ctx).SnapshotReader(atRevision)
-	ts := schema.NewTypeSystem(schema.ResolverForDatastoreReader(ds))
+	dl := datalayer.MustFromContext(ctx).SnapshotReader(atRevision)
+	sr, err := dl.ReadSchema()
+	if err != nil {
+		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
+	}
+	ts := schema.NewTypeSystem(schema.ResolverFor(sr))
 	vdef, err := ts.GetValidatedDefinition(ctx, req.DefinitionName)
 	if err != nil {
 		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
@@ -615,7 +619,7 @@ func (es *experimentalServer) ExperimentalComputablePermissions(ctx context.Cont
 		}
 	}
 
-	allNamespaces, err := ds.LegacyListAllNamespaces(ctx)
+	allNamespaces, err := sr.ListAllTypeDefinitions(ctx)
 	if err != nil {
 		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
 	}
@@ -682,8 +686,12 @@ func (es *experimentalServer) ExperimentalDependentRelations(ctx context.Context
 		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
 	}
 
-	ds := datastoremw.MustFromContext(ctx).SnapshotReader(atRevision)
-	ts := schema.NewTypeSystem(schema.ResolverForDatastoreReader(ds))
+	dl := datalayer.MustFromContext(ctx).SnapshotReader(atRevision)
+	sr, err := dl.ReadSchema()
+	if err != nil {
+		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
+	}
+	ts := schema.NewTypeSystem(schema.ResolverFor(sr))
 	vdef, err := ts.GetValidatedDefinition(ctx, req.DefinitionName)
 	if err != nil {
 		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
@@ -746,14 +754,19 @@ func (es *experimentalServer) ExperimentalRegisterRelationshipCounter(ctx contex
 		}
 	})
 
-	ds := datastoremw.MustFromContext(ctx)
+	dl := datalayer.MustFromContext(ctx)
 
 	if req.Name == "" {
 		return nil, shared.RewriteErrorWithoutConfig(ctx, spiceerrors.WithCodeAndReason(errors.New("name must be provided"), codes.InvalidArgument, v1.ErrorReason_ERROR_REASON_UNSPECIFIED))
 	}
 
-	_, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
-		if err := validateRelationshipsFilter(ctx, req.RelationshipFilter, rwt); err != nil {
+	_, err := dl.ReadWriteTx(ctx, func(ctx context.Context, rwt datalayer.ReadWriteTransaction) error {
+		sr, err := rwt.ReadSchema()
+		if err != nil {
+			return err
+		}
+
+		if err := validateRelationshipsFilter(ctx, req.RelationshipFilter, sr); err != nil {
 			return err
 		}
 
@@ -774,13 +787,13 @@ func (es *experimentalServer) ExperimentalUnregisterRelationshipCounter(ctx cont
 		}
 	})
 
-	ds := datastoremw.MustFromContext(ctx)
+	dl := datalayer.MustFromContext(ctx)
 
 	if req.Name == "" {
 		return nil, shared.RewriteErrorWithoutConfig(ctx, spiceerrors.WithCodeAndReason(errors.New("name must be provided"), codes.InvalidArgument, v1.ErrorReason_ERROR_REASON_UNSPECIFIED))
 	}
 
-	_, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+	_, err := dl.ReadWriteTx(ctx, func(ctx context.Context, rwt datalayer.ReadWriteTransaction) error {
 		return rwt.UnregisterCounter(ctx, req.Name)
 	})
 	if err != nil {
@@ -801,13 +814,13 @@ func (es *experimentalServer) ExperimentalCountRelationships(ctx context.Context
 		return nil, shared.RewriteErrorWithoutConfig(ctx, spiceerrors.WithCodeAndReason(errors.New("name must be provided"), codes.InvalidArgument, v1.ErrorReason_ERROR_REASON_UNSPECIFIED))
 	}
 
-	ds := datastoremw.MustFromContext(ctx)
-	headRev, err := ds.HeadRevision(ctx)
+	dl := datalayer.MustFromContext(ctx)
+	headRev, err := dl.HeadRevision(ctx)
 	if err != nil {
 		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
 	}
 
-	snapshotReader := ds.SnapshotReader(headRev)
+	snapshotReader := dl.SnapshotReader(headRev)
 	count, err := snapshotReader.CountRelationships(ctx, req.Name)
 	if err != nil {
 		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
@@ -818,7 +831,7 @@ func (es *experimentalServer) ExperimentalCountRelationships(ctx context.Context
 		return nil, spiceerrors.MustBugf("count should not be negative")
 	}
 
-	readAt, err := zedtoken.NewFromRevision(ctx, headRev, ds)
+	readAt, err := zedtoken.NewFromRevision(ctx, headRev, dl)
 	if err != nil {
 		return nil, shared.RewriteErrorWithoutConfig(ctx, err)
 	}
@@ -835,7 +848,7 @@ func (es *experimentalServer) ExperimentalCountRelationships(ctx context.Context
 
 func queryForEach(
 	ctx context.Context,
-	reader datastore.Reader,
+	reader datalayer.RevisionedReader,
 	filter datastore.RelationshipsFilter,
 	fn func(rel tuple.Relationship),
 	opts ...dsoptions.QueryOptionsOption,
@@ -857,7 +870,7 @@ func queryForEach(
 	return cursor, nil
 }
 
-func decodeCursor(ds datastore.ReadOnlyDatastore, encoded *v1.Cursor) (datastore.Revision, string, dsoptions.Cursor, error) {
+func decodeCursor(dl datalayer.DataLayer, encoded *v1.Cursor) (datastore.Revision, string, dsoptions.Cursor, error) {
 	decoded, err := cursor.Decode(encoded)
 	if err != nil {
 		return datastore.NoRevision, "", nil, err
@@ -871,7 +884,7 @@ func decodeCursor(ds datastore.ReadOnlyDatastore, encoded *v1.Cursor) (datastore
 		return datastore.NoRevision, "", nil, errors.New("malformed cursor: wrong number of components")
 	}
 
-	atRevision, err := ds.RevisionFromString(decoded.GetV1().Revision)
+	atRevision, err := dl.RevisionFromString(decoded.GetV1().Revision)
 	if err != nil {
 		return datastore.NoRevision, "", nil, err
 	}
