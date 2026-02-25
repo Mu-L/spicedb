@@ -704,7 +704,7 @@ func TestOutline_CompileDecompileRoundtrip(t *testing.T) {
 		require.NoError(err)
 
 		// Should be equal to canonical form
-		require.True(canonical.Equals(roundtrip))
+		require.True(canonical.Root.Equals(roundtrip))
 	})
 
 	t.Run("ComplexNestedStructure", func(t *testing.T) {
@@ -740,7 +740,7 @@ func TestOutline_CompileDecompileRoundtrip(t *testing.T) {
 		require.NoError(err)
 
 		// Should be equal to canonical form
-		require.True(canonical.Equals(roundtrip))
+		require.True(canonical.Root.Equals(roundtrip))
 	})
 
 	t.Run("ArrowWithDatastore", func(t *testing.T) {
@@ -777,7 +777,7 @@ func TestOutline_CompileDecompileRoundtrip(t *testing.T) {
 		require.NoError(err)
 
 		// Should be equal to canonical form
-		require.True(canonical.Equals(roundtrip))
+		require.True(canonical.Root.Equals(roundtrip))
 	})
 
 	t.Run("CaveatIterator", func(t *testing.T) {
@@ -806,7 +806,7 @@ func TestOutline_CompileDecompileRoundtrip(t *testing.T) {
 		require.NoError(err)
 
 		// Should be equal to canonical form
-		require.True(canonical.Equals(roundtrip))
+		require.True(canonical.Root.Equals(roundtrip))
 	})
 }
 
@@ -1377,8 +1377,9 @@ func TestSerializeOutline(t *testing.T) {
 			},
 		}
 
+		// Caveat is a filter operation — Serialize() delegates to its child
 		key := outline.Serialize()
-		require.Equal("C(cav:age_check)[0]", key.String())
+		require.Equal("0", key.String())
 	})
 
 	t.Run("AliasIteratorType", func(t *testing.T) {
@@ -1541,22 +1542,22 @@ func TestSerializeOutline_Args(t *testing.T) {
 	})
 }
 
-func TestSerializeOutline_IgnoresCanonicalKey(t *testing.T) {
+func TestSerializeOutline_IgnoresID(t *testing.T) {
 	t.Parallel()
 	require := require.New(t)
 
-	// Create two identical outlines with different CanonicalKeys
+	// Create two identical outlines with different IDs
 	outline1 := Outline{
-		Type:         NullIteratorType,
-		CanonicalKey: CanonicalKey("key1"),
+		Type: NullIteratorType,
+		ID:   OutlineNodeID(1),
 	}
 
 	outline2 := Outline{
-		Type:         NullIteratorType,
-		CanonicalKey: CanonicalKey("key2"),
+		Type: NullIteratorType,
+		ID:   OutlineNodeID(2),
 	}
 
-	// Serialization should be identical (ignoring CanonicalKey field)
+	// Serialization should be identical (ignoring ID field)
 	key1 := outline1.Serialize()
 	key2 := outline2.Serialize()
 	require.Equal(key1.String(), key2.String())
