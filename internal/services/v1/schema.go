@@ -127,6 +127,9 @@ func (ss *schemaServer) WriteSchema(ctx context.Context, in *v1.WriteSchemaReque
 	}
 
 	opts = append(opts, compiler.CaveatTypeSet(ss.caveatTypeSet))
+	// Imports don't make sense in a schema written directly to SpiceDB;
+	// the user must first compile them with `zed`
+	opts = append(opts, compiler.DisallowImportFlag())
 
 	compiled, err := compiler.Compile(compiler.InputSchema{
 		Source:       input.Source("schema"),

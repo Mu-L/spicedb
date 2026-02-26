@@ -3,6 +3,8 @@ package compiler
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 
 	"google.golang.org/protobuf/proto"
 
@@ -56,6 +58,10 @@ type config struct {
 	objectTypePrefix *string
 	allowedFlags     *mapz.Set[string]
 	caveatTypeSet    *caveattypes.TypeSet
+
+	// In an import context, this is the FS containing
+	// the importing schema (as opposed to imported schemas)
+	sourceFS fs.FS
 }
 
 func SkipValidation() Option { return func(cfg *config) { cfg.skipValidation = true } }
@@ -76,18 +82,39 @@ func CaveatTypeSet(cts *caveattypes.TypeSet) Option {
 	return func(cfg *config) { cfg.caveatTypeSet = cts }
 }
 
+// Config that supplies the root source folder for compilation. Required
+// for relative import syntax to work properly.
+func SourceFolder(sourceFolder string) Option {
+	return func(cfg *config) { cfg.sourceFS = os.DirFS(sourceFolder) }
+}
+
+// Config that supplies the fs.FS for compilation as an alternative to
+// SourceFolder.
+func SourceFS(fsys fs.FS) Option {
+	return func(cfg *config) { cfg.sourceFS = fsys }
+}
+
 const (
 	expirationFlag   = "expiration"
 	selfFlag         = "self"
 	typeCheckingFlag = "typechecking"
 	partialFlag      = "partial"
+	importFlag       = "import"
 )
 
-var allowedFlags = mapz.NewSet(expirationFlag, selfFlag, typeCheckingFlag, partialFlag)
+func allowedFlags() *mapz.Set[string] {
+	return mapz.NewSet(expirationFlag, selfFlag, typeCheckingFlag, partialFlag, importFlag)
+}
 
 func DisallowExpirationFlag() Option {
 	return func(cfg *config) {
 		cfg.allowedFlags.Delete(expirationFlag)
+	}
+}
+
+func DisallowImportFlag() Option {
+	return func(cfg *config) {
+		cfg.allowedFlags.Delete(importFlag)
 	}
 }
 
@@ -98,7 +125,7 @@ type ObjectPrefixOption func(*config)
 // Compile compilers the input schema into a set of namespace definition protos.
 func Compile(schema InputSchema, prefix ObjectPrefixOption, opts ...Option) (*CompiledSchema, error) {
 	cfg := &config{
-		allowedFlags: allowedFlags,
+		allowedFlags: allowedFlags(),
 	}
 
 	prefix(cfg) // required option
@@ -107,12 +134,34 @@ func Compile(schema InputSchema, prefix ObjectPrefixOption, opts ...Option) (*Co
 		fn(cfg)
 	}
 
-	mapper := newPositionMapper(schema)
-	root := parser.Parse(createAstNode, schema.Source, schema.SchemaString).(*dslNode)
-	errs := root.FindAll(dslshape.NodeTypeError)
-	if len(errs) > 0 {
-		err := errorNodeToError(errs[0], mapper)
+	root, mapper, err := parseSchema(schema)
+	if err != nil {
 		return nil, err
+	}
+
+	present, err := validateImportPresence(cfg.allowedFlags.Has(importFlag), root)
+	if err != nil {
+		// This condition should basically always be satisfied (we trigger errors off of the node),
+		// but we're defensive here in case the implementation changes.
+		var withNodeError withNodeError
+		if errors.As(err, &withNodeError) {
+			return nil, toContextError(withNodeError.Error(), withNodeError.errorSourceCode, withNodeError.node, mapper)
+		}
+		return nil, err
+	}
+
+	if present {
+		// NOTE: import translation is done separately so that partial references
+		// and definitions defined in separate files can correctly resolve.
+		err = translateImports(importResolutionContext{
+			globallyVisitedFiles: mapz.NewSet[string](),
+			locallyVisitedFiles:  mapz.NewSet[string](),
+			sourceFS:             cfg.sourceFS,
+			mapper:               mapper,
+		}, root)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	initialCompiledPartials := make(map[string][]*core.Relation)
@@ -139,6 +188,34 @@ func Compile(schema InputSchema, prefix ObjectPrefixOption, opts ...Option) (*Co
 	}
 
 	return compiled, nil
+}
+
+func parseSchema(schema InputSchema) (*dslNode, input.PositionMapper, error) {
+	mapper := newPositionMapper(schema)
+	root := parser.Parse(createAstNode, schema.Source, schema.SchemaString).(*dslNode)
+	errs := root.FindAll(dslshape.NodeTypeError)
+	if len(errs) > 0 {
+		err := errorNodeToError(errs[0], mapper)
+		return nil, nil, err
+	}
+	return root, mapper, nil
+}
+
+// validateImportPresence validates whether a given AST is valid based on whether
+// imports are allowed in the context. if they're present and disallowed it returns
+// a validation error; otherwise it returns the presence.
+func validateImportPresence(allowed bool, root *dslNode) (present bool, err error) {
+	present = false
+	for _, topLevelNode := range root.GetChildren() {
+		// Process import nodes; ignore the others
+		if topLevelNode.GetType() == dslshape.NodeTypeImport {
+			if !allowed {
+				return false, topLevelNode.Errorf("import statements are not allowed in this context")
+			}
+			present = true
+		}
+	}
+	return present, nil
 }
 
 func errorNodeToError(node *dslNode, mapper input.PositionMapper) error {

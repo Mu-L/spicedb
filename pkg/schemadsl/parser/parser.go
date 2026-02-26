@@ -2,6 +2,8 @@
 package parser
 
 import (
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/authzed/spicedb/pkg/schemadsl/dslshape"
@@ -68,6 +70,9 @@ Loop:
 		case p.isKeyword("caveat"):
 			hasSeenDefinition = true
 			rootNode.Connect(dslshape.NodePredicateChild, p.consumeCaveat())
+
+		case p.isKeyword("import"):
+			rootNode.Connect(dslshape.NodePredicateChild, p.consumeImport())
 
 		case p.isKeyword("partial"):
 			rootNode.Connect(dslshape.NodePredicateChild, p.consumePartial())
@@ -262,7 +267,8 @@ func (p *sourceParser) consumeUseFlag(afterDefinition bool) AstNode {
 	}
 
 	if _, ok := lexer.Flags[useFlag]; !ok {
-		p.emitErrorf("Unknown use flag: `%s`. Options are: %s", useFlag, strings.Join(lexer.AllUseFlags, ", "))
+		opts := strings.Join(slices.Sorted(maps.Keys(lexer.Flags)), ", ")
+		p.emitErrorf("Unknown use flag: `%s`. Options are: %s", useFlag, opts)
 		return useNode
 	}
 
@@ -766,4 +772,23 @@ func (p *sourceParser) tryConsumeSelfExpression() (AstNode, bool) {
 	p.consumeKeyword("self")
 	defer p.mustFinishNode()
 	return node, true
+}
+
+func (p *sourceParser) consumeImport() AstNode {
+	importNode := p.startNode(dslshape.NodeTypeImport)
+	defer p.mustFinishNode()
+
+	// import ...
+	// NOTE: error handling isn't necessary here because this function is only
+	// invoked if the `import` keyword is found in the function above.
+	p.consumeKeyword("import")
+
+	importPath, ok := p.consumeStringLiteral()
+	if !ok {
+		return importNode
+	}
+
+	importNode.MustDecorate(dslshape.NodeImportPredicatePath, importPath)
+
+	return importNode
 }
