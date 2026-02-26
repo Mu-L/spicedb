@@ -18,7 +18,9 @@ func TestRecursiveSentinel(t *testing.T) {
 	require.Equal(t, "folder", sentinel.DefinitionName())
 	require.Equal(t, "view", sentinel.RelationName())
 	require.False(t, sentinel.WithSubRelations())
-	require.NotEmpty(t, sentinel.ID(), "ID should be a non-empty UUID")
+	// Canonical key not set on construction (needs compilation)
+	// Just verify the sentinel canonical key can be retrieved without panic
+	_ = sentinel.CanonicalKey()
 
 	// Test that sentinel returns empty sequences
 	ds, err := memdb.NewMemdbDatastore(0, 0, memdb.DisableGC)
@@ -43,10 +45,9 @@ func TestRecursiveSentinel(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, paths)
 
-	// Test Clone - should generate a new UUID
+	// Test Clone - cloned sentinel shares the same canonical key
 	cloned := sentinel.Clone()
-	require.NotEqual(t, sentinel.ID(), cloned.(*RecursiveSentinelIterator).ID())
-	require.NotEmpty(t, cloned.(*RecursiveSentinelIterator).ID())
+	require.Equal(t, sentinel.CanonicalKey(), cloned.(*RecursiveSentinelIterator).CanonicalKey())
 }
 
 func TestRecursiveIteratorEmptyBaseCase(t *testing.T) {
