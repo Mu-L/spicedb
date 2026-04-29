@@ -24,6 +24,7 @@ import (
 	dispatchpkg "github.com/authzed/spicedb/internal/dispatch"
 	"github.com/authzed/spicedb/internal/graph"
 	"github.com/authzed/spicedb/internal/graph/computed"
+	"github.com/authzed/spicedb/internal/logging"
 	"github.com/authzed/spicedb/internal/middleware/perfinsights"
 	"github.com/authzed/spicedb/internal/middleware/usagemetrics"
 	"github.com/authzed/spicedb/internal/namespace"
@@ -625,12 +626,23 @@ func (ps *permissionServer) lookupResources3(req *v1.LookupResourcesRequest, res
 				ObjectId:  req.Subject.Object.ObjectId,
 				Relation:  normalizeSubjectRelation(req.Subject),
 			},
-			Context:        req.Context,
-			OptionalCursor: currentCursor,
-			OptionalLimit:  req.OptionalLimit,
+			Context:          req.Context,
+			OptionalCursor:   currentCursor,
+			OptionalLimit:    req.OptionalLimit,
+			EnableDebugTrace: req.WithDebug,
 		},
 		stream)
 	if err != nil {
+		if req.WithDebug && dispatchpkg.IsMaxDepthExceeded(err) {
+			if debugInfo := dispatchpkg.ExtractTraversalTrace(err); debugInfo != nil {
+				// We'll only attach debug info if cyclemembers is non-empty. Otherwise we're
+				// in a normal recursion-too-deep scenario and the debuginfo doesn't help.
+				if len(debugInfo.CycleMembers) > 0 {
+					logging.Warn().Strs("cycle-members", debugInfo.CycleMembers).Msg("The following resource/relation pairs were found in a cycle in LookupResources:")
+					err = spiceerrors.AppendDetailsMetadata(err, spiceerrors.DebugTraceErrorDetailsKey, debugInfo.String())
+				}
+			}
+		}
 		return ps.rewriteError(ctx, err)
 	}
 
@@ -772,12 +784,23 @@ func (ps *permissionServer) lookupResources2(req *v1.LookupResourcesRequest, res
 				ObjectId:  req.Subject.Object.ObjectId,
 				Relation:  normalizeSubjectRelation(req.Subject),
 			},
-			Context:        req.Context,
-			OptionalCursor: currentCursor,
-			OptionalLimit:  req.OptionalLimit,
+			Context:          req.Context,
+			OptionalCursor:   currentCursor,
+			OptionalLimit:    req.OptionalLimit,
+			EnableDebugTrace: req.WithDebug,
 		},
 		stream)
 	if err != nil {
+		if req.WithDebug && dispatchpkg.IsMaxDepthExceeded(err) {
+			if debugInfo := dispatchpkg.ExtractTraversalTrace(err); debugInfo != nil {
+				// We'll only attach debug info if cyclemembers is non-empty. Otherwise we're
+				// in a normal recursion-too-deep scenario and the debuginfo doesn't help.
+				if len(debugInfo.CycleMembers) > 0 {
+					logging.Warn().Strs("cycle-members", debugInfo.CycleMembers).Msg("The following resource/relation pairs were found in a cycle in LookupResources:")
+					err = spiceerrors.AppendDetailsMetadata(err, spiceerrors.DebugTraceErrorDetailsKey, debugInfo.String())
+				}
+			}
+		}
 		return ps.rewriteError(ctx, err)
 	}
 
