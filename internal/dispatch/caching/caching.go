@@ -405,8 +405,55 @@ func (cd *Dispatcher) DispatchLookupSubjects(req *v1.DispatchLookupSubjectsReque
 }
 
 func (cd *Dispatcher) DispatchQueryPlan(req *v1.DispatchQueryPlanRequest, stream dispatch.PlanStream) error {
-	// TODO: add caching logic
-	return cd.d.DispatchQueryPlan(req, stream)
+	switch req.Operation {
+	case v1.PlanOperation_PLAN_OPERATION_CHECK:
+		return cd.dispatchQueryPlanCheckCached(req, stream)
+	default:
+		// TODO: add caching for LookupResources and LookupSubjects
+		return cd.d.DispatchQueryPlan(req, stream)
+	}
+}
+
+func (cd *Dispatcher) dispatchQueryPlanCheckCached(req *v1.DispatchQueryPlanRequest, stream dispatch.PlanStream) error {
+	cd.checkTotalCounter.Inc()
+
+	requestKey, err := cd.keyHandler.PlanCheckCacheKey(stream.Context(), req)
+	if err != nil {
+		return err
+	}
+
+	if cachedPathRaw, found := cd.c.Get(requestKey); found {
+		var cachedPath v1.ResultPath
+		if err := cachedPath.UnmarshalVT(cachedPathRaw.([]byte)); err != nil {
+			return err
+		}
+		cd.checkFromCacheCounter.Inc()
+		return stream.Publish(&v1.DispatchQueryPlanResponse{
+			Paths: []*v1.ResultPath{&cachedPath},
+		})
+	}
+
+	// Cache miss — collect the streamed result to cache the path.
+	// Check produces at most one response containing a single ResultPath.
+	collecting := dispatch.NewCollectingDispatchStream[*v1.DispatchQueryPlanResponse](stream.Context())
+	if err := cd.d.DispatchQueryPlan(req, collecting); err != nil {
+		return err
+	}
+
+	for _, resp := range collecting.Results() {
+		if len(resp.Paths) > 0 {
+			pathBytes, err := resp.Paths[0].MarshalVT()
+			if err == nil {
+				cd.c.Set(requestKey, pathBytes, sliceSize(pathBytes))
+			}
+		}
+
+		if err := stream.Publish(resp); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (cd *Dispatcher) Close() error {

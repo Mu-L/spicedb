@@ -1,9 +1,12 @@
 package keys
 
 import (
-	"sort"
+	"slices"
 	"strconv"
 
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"github.com/authzed/spicedb/pkg/caveats"
 	core "github.com/authzed/spicedb/pkg/proto/core/v1"
 	v1 "github.com/authzed/spicedb/pkg/proto/dispatch/v1"
 	"github.com/authzed/spicedb/pkg/tuple"
@@ -38,7 +41,7 @@ func (hid hashableIds) AppendToHash(hasher hasherInterface) {
 	// with others accessing the slice.
 	c := make([]string, len(hid))
 	copy(c, hid)
-	sort.Strings(c)
+	slices.Sort(c)
 
 	for _, id := range c {
 		hasher.WriteString(id)
@@ -98,4 +101,19 @@ type hashableContextString string
 
 func (hc hashableContextString) AppendToHash(hasher hasherInterface) {
 	hasher.WriteString(string(hc))
+}
+
+type hashableContext struct {
+	*structpb.Struct
+}
+
+func (hc hashableContext) AppendToHash(hasher hasherInterface) {
+	if hc.Struct == nil {
+		return
+	}
+	stable, err := caveats.StableContextStringForHashing(hc.Struct)
+	if err != nil {
+		return
+	}
+	hasher.WriteString(stable)
 }
