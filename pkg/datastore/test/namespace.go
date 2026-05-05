@@ -41,8 +41,9 @@ func NamespaceNotFoundTest(t *testing.T, tester DatastoreTester) {
 
 	ctx := t.Context()
 
-	startRevision, err := ds.HeadRevision(ctx)
+	startRevisionResult, err := ds.HeadRevision(ctx)
 	require.NoError(err)
+	startRevision := startRevisionResult.Revision
 
 	_, _, err = ds.SnapshotReader(startRevision).LegacyReadNamespaceByName(ctx, "unknown")
 	require.ErrorAs(err, &datastore.NamespaceNotFoundError{})
@@ -58,8 +59,9 @@ func NamespaceWriteTest(t *testing.T, tester DatastoreTester) {
 
 	ctx := t.Context()
 
-	startRevision, err := ds.HeadRevision(ctx)
+	startRevisionResult, err := ds.HeadRevision(ctx)
 	require.NoError(err)
+	startRevision := startRevisionResult.Revision
 
 	nsDefs, err := ds.SnapshotReader(startRevision).LegacyListAllNamespaces(ctx)
 	require.NoError(err)
@@ -147,7 +149,7 @@ func NamespaceDeleteTest(t *testing.T, tester DatastoreTester) {
 	rawDS, err := tester.New(t, 0, veryLargeGCInterval, veryLargeGCWindow, 1)
 	require.NoError(err)
 
-	ds, revision := testfixtures.StandardDatastoreWithData(rawDS, require)
+	ds, revision := testfixtures.StandardDatastoreWithData(t, rawDS)
 	ctx := t.Context()
 
 	tRequire := testfixtures.RelationshipChecker{Require: require, DS: ds}
@@ -161,7 +163,11 @@ func NamespaceDeleteTest(t *testing.T, tester DatastoreTester) {
 	require.NotNil(folderTpl)
 	tRequire.RelationshipExists(ctx, folderTpl, revision)
 
+	// TODO: it's as though the rwt is at the wrong revision?
+	// Or that something is delegating when it shouldn't be or isn't wrapped correctly?
+	// Where are these testers wrapped?
 	deletedRev, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		// I've validated that the schema is written at this time.
 		return rwt.LegacyDeleteNamespaces(ctx, []string{testfixtures.DocumentNS.Name}, datastore.DeleteNamespacesAndRelationships)
 	})
 	require.NoError(err)
@@ -181,8 +187,9 @@ func NamespaceDeleteTest(t *testing.T, tester DatastoreTester) {
 		require.NotEqual(testfixtures.DocumentNS.Name, ns.Definition.Name, "deleted namespace '%s' should not be in namespace list", ns.Definition.Name)
 	}
 
-	deletedRevision, err := ds.HeadRevision(ctx)
+	deletedRevisionResult, err := ds.HeadRevision(ctx)
 	require.NoError(err)
+	deletedRevision := deletedRevisionResult.Revision
 
 	iter, err := ds.SnapshotReader(deletedRevision).QueryRelationships(ctx, datastore.RelationshipsFilter{
 		OptionalResourceType: testfixtures.DocumentNS.Name,
@@ -199,7 +206,7 @@ func NamespaceDeleteNoRelationshipsTest(t *testing.T, tester DatastoreTester) {
 	rawDS, err := tester.New(t, 0, veryLargeGCInterval, veryLargeGCWindow, 1)
 	require.NoError(err)
 
-	ds, revision := testfixtures.StandardDatastoreWithSchema(rawDS, require)
+	ds, revision := testfixtures.StandardDatastoreWithSchema(t, rawDS)
 	ctx := t.Context()
 
 	tRequire := testfixtures.RelationshipChecker{Require: require, DS: ds}
@@ -233,7 +240,7 @@ func NamespaceMultiDeleteTest(t *testing.T, tester DatastoreTester) {
 	rawDS, err := tester.New(t, 0, veryLargeGCInterval, veryLargeGCWindow, 1)
 	require.NoError(t, err)
 
-	ds, revision := testfixtures.StandardDatastoreWithData(rawDS, require.New(t))
+	ds, revision := testfixtures.StandardDatastoreWithData(t, rawDS)
 	ctx := t.Context()
 
 	namespaces, err := ds.SnapshotReader(revision).LegacyListAllNamespaces(ctx)
@@ -261,7 +268,7 @@ func EmptyNamespaceDeleteTest(t *testing.T, tester DatastoreTester) {
 	rawDS, err := tester.New(t, 0, veryLargeGCInterval, veryLargeGCWindow, 1)
 	require.NoError(err)
 
-	ds, revision := testfixtures.StandardDatastoreWithData(rawDS, require)
+	ds, revision := testfixtures.StandardDatastoreWithData(t, rawDS)
 	ctx := t.Context()
 
 	deletedRev, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {

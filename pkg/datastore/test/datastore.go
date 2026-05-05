@@ -7,8 +7,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/authzed/spicedb/pkg/datalayer"
 	"github.com/authzed/spicedb/pkg/datastore"
+	"github.com/authzed/spicedb/pkg/genutil/slicez"
 	"github.com/authzed/spicedb/pkg/namespace"
+	"github.com/authzed/spicedb/pkg/schemadsl/compiler"
+	"github.com/authzed/spicedb/pkg/schemadsl/generator"
 	"github.com/authzed/spicedb/pkg/tuple"
 )
 
@@ -224,6 +228,20 @@ func AllWithExceptions(t *testing.T, tester DatastoreTester, except Categories) 
 	t.Run("TestRelationshipCounterOverExpired", runner(tester, RelationshipCounterOverExpiredTest))
 	t.Run("TestRegisterRelationshipCountersInParallel", runner(tester, RegisterRelationshipCountersInParallelTest))
 	t.Run("TestRelationshipCountersWithOddFilter", runner(tester, RelationshipCountersWithOddFilterTest))
+
+	t.Run("TestStoredSchemaNotFound", runner(tester, StoredSchemaNotFoundTest))
+	t.Run("TestStoredSchemaWriteRead", runner(tester, StoredSchemaWriteReadTest))
+	t.Run("TestStoredSchemaRevision", runner(tester, StoredSchemaRevisionTest))
+	t.Run("TestStoredSchemaUpdate", runner(tester, StoredSchemaUpdateTest))
+	t.Run("TestStoredSchemaMultipleRevisions", runner(tester, StoredSchemaMultipleRevisionsTest))
+	if !except.Transaction() {
+		t.Run("TestStoredSchemaReadWithinTransaction", runner(tester, StoredSchemaReadWithinTransactionTest))
+	}
+	t.Run("TestStoredSchemaStableText", runner(tester, StoredSchemaStableTextTest))
+	t.Run("TestStoredSchemaLarge", runner(tester, StoredSchemaLargeTest))
+	t.Run("TestStoredSchemaPhaseMigration", runner(tester, StoredSchemaPhaseMigrationTest))
+	t.Run("TestHeadRevisionSchemaHash", runner(tester, HeadRevisionSchemaHashTest))
+	t.Run("TestOptimizedRevisionSchemaHash", runner(tester, OptimizedRevisionSchemaHashTest))
 }
 
 func OnlyGCTests(t *testing.T, tester DatastoreTester) {
@@ -268,13 +286,22 @@ func makeTestRel(resourceID, userID string) tuple.Relationship {
 	}
 }
 
-func setupDatastore(ds datastore.Datastore, require *require.Assertions) datastore.Revision {
-	ctx := context.Background()
+func setupDatastore(t *testing.T, ds datastore.Datastore) datastore.Revision {
+	ctx := t.Context()
 
-	revision, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
-		return rwt.LegacyWriteNamespaces(ctx, testGroupNS, testResourceNS, testUserNS)
+	schemaDefinitions := []datastore.SchemaDefinition{testGroupNS.CloneVT(), testResourceNS.CloneVT(), testUserNS.CloneVT()}
+	compilerDefinitions := slicez.Map(schemaDefinitions, func(def datastore.SchemaDefinition) compiler.SchemaDefinition {
+		return def.(compiler.SchemaDefinition)
 	})
-	require.NoError(err)
+	// TODO: is this really necessary? Might be worth refactoring.
+	schemaText, _, err := generator.GenerateSchema(ctx, compilerDefinitions)
+
+	require.NoError(t, err)
+	revision, err := ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
+		// TODO: add cache to this?
+		return datalayer.WriteSchemaViaStoredSchema(ctx, rwt, schemaDefinitions, schemaText, nil)
+	})
+	require.NoError(t, err)
 
 	return revision
 }
